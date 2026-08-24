@@ -76,6 +76,14 @@ class TidyupStateMachineNode(Node):
                 'failed': 'FAILED',
             },
         )
+        #drawerのステートマシン
+        # self.state_machine.add_state(
+        #     name='drawer',
+        #     state=drawerawerState(self),
+        #     transitions={
+        #         'succeeded': 'Move2GraspPoint',
+        #     }
+        # )
 
         self.viewer = YasminViewerPub(
             fsm_name='TEAMD_TIDYUP',
