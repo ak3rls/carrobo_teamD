@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>teamd_tidyup_pkg</name>
+  <version>0.1.0</version>
+  <description>Car-Robo @Home tidy-up task state machine example</description>
+  <maintainer email="takeyama.ren796@mail.kyutech.jp">carrobo2026</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf_transformations</depend>
+  <depend>navigation_tools</depend>
+  <depend>carrobo_manipulation_pkg</depend>
+  <depend>yolov8_detection_interfaces</depend>
+  <depend>grasp_point_detection_interfaces</depend>
+
+  <exec_depend>yasmin</exec_depend>
+  <exec_depend>yasmin_msgs</exec_depend>
+  <exec_depend>yasmin_ros</exec_depend>
+  <exec_depend>yasmin_viewer</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>yolov8_detection</exec_depend>
+  <exec_depend>grasp_point_detection</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
