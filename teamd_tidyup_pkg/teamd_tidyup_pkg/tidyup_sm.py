@@ -16,8 +16,10 @@ from carrobo_manipulation_pkg.hsrif import HSRInterfaces
 from .states.grasp import GraspState
 from .states.move_to_grasp_point import Move2GraspPointState
 from .states.move_to_place_point import Move2PlacePointState
+from .states.move_to_room import Move2RoomState
 from .states.place import PlaceState
 from .states.recog import RecogState
+from .states.drawer_open import DrawerOpenTask, OpenDrawersState
 
 
 class TidyupStateMachineNode(Node):
@@ -85,15 +87,35 @@ class TidyupStateMachineNode(Node):
         #     }
         # )
 
+        self.state_machine.add_state(
+            name='MoveRoomF2B',
+            state=Move2RoomState(self, self.nav, source_room='roomF', target_room='roomA'),
+            transitions={
+                'succeeded': 'Move2GraspPoint',
+                'failed': 'FAILED',
+            },
+        )
+
+        self.state_machine.add_state(
+            name='MoveRoomB2A',
+            state=Move2RoomState(self, self.nav, source_room='roomA', target_room='roomB'),
+            transitions={
+                'succeeded': 'Move2GraspPoint',
+                'failed': 'FAILED',
+            },
+        )
+
         self.viewer = YasminViewerPub(
             fsm_name='TEAMD_TIDYUP',
             fsm=self.state_machine,
+            node=self,
         )
 
         self.blackboard = Blackboard()
         self.blackboard.grasp_pose = None
         self.blackboard.grasp_approach = 0.0
         self.blackboard.target_name = ''
+        self.blackboard.current_room = 'roomF'
 
     def run(self) -> str:
         """ステートマシンを実行し、最終 outcome を返す."""
@@ -106,7 +128,6 @@ class TidyupStateMachineNode(Node):
         if self.nav.is_navigating:
             self.nav.cancel_nav_action()
         self.nav.shutdown()
-        self.viewer.shutdown()
 
 
 def main(args=None):

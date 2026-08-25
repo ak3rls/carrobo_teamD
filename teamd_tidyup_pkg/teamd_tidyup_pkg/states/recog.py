@@ -28,7 +28,7 @@ from carrobo_manipulation_pkg.hsrif import HSRInterfaces
 # ロボット自身を選ぶ可能性があるため、通常は物体名を指定してください。
 TARGET_NAME = ''
 
-CONFIDENCE_THRESHOLD = 0.8
+CONFIDENCE_THRESHOLD = 0.25
 MAX_GRASP_DISTANCE = 2.0
 TALL_THRESHOLD = 0.15
 HEAD_TILT = math.radians(-50.0)

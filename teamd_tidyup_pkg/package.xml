@@ -23,6 +23,7 @@
   <exec_depend>yasmin_viewer</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>yolov8_detection</exec_depend>
   <exec_depend>grasp_point_detection</exec_depend>
 
