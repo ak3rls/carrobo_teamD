@@ -18,19 +18,11 @@ from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-_WORKSPACE = os.environ.get(
-    'COLCON_WORKSPACE', os.path.expanduser('~/hma2_ws')
-)
-DEFAULT_MODEL_PATH = os.path.join(
-    _WORKSPACE,
-    'src',
-    '5_perception',
-    'hma_object_detection2',
-    'hma_object_detection2',
+DEFAULT_MODEL_PATH = PathJoinSubstitution([
+    FindPackageShare('teamd_tidyup_pkg'),
     'models',
-    'yoloe',
-    'yoloe-11s-seg.pt',
-)
+    '2_yolov11s_10.pt',
+])
 INITIAL_POSE = (
     '{header: {stamp: now, frame_id: map}, pose: {pose: {'
     'position: {x: 0.0, y: 0.0, z: 0.0}, '
@@ -252,7 +244,7 @@ def generate_launch_description():
                 'model_path',
                 default_value=DEFAULT_MODEL_PATH,
                 description=(
-                    '物体検出の重みファイル (既定: YOLOE 11s segmentation)'
+                    '物体検出の重みファイル (既定: 2_yolov11s_10.pt)'
                 ),
             ),
             DeclareLaunchArgument(
