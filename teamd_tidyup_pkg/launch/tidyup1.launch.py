@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""認識サービスと片付けステートマシンをまとめて起動する."""
+"""認識サービスと片付けステートマシン(Drawerステート無し)をまとめて起動する."""
 
 import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import ExecuteProcess
+from launch.actions import LogInfo
 from launch.actions import OpaqueFunction
 from launch.actions import RegisterEventHandler
 from launch.actions import TimerAction
@@ -17,18 +18,15 @@ from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-_WORKSPACE = os.environ.get(
-    'COLCON_WORKSPACE', os.path.expanduser('~/hma2_ws')
-)
-DEFAULT_MODEL_PATH = os.path.join(
-    _WORKSPACE,
-    'src',
-    '5_perception',
-    'hma_object_detection2',
-    'hma_object_detection2',
+DEFAULT_MODEL_PATH = PathJoinSubstitution([
+    FindPackageShare('teamd_tidyup_pkg'),
     'models',
-    'yoloe',
-    'yoloe-11s-seg.pt',
+    '2_yolov11s_10.pt',
+])
+INITIAL_POSE = (
+    '{header: {stamp: now, frame_id: map}, pose: {pose: {'
+    'position: {x: 0.0, y: 0.0, z: 0.0}, '
+    'orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}'
 )
 
 
@@ -74,7 +72,7 @@ def yoloe_detection_actions(context, *args, **kwargs):
 
 
 def create_tidyup_sm_node():
-    """Return the state-machine node with the calibrated drawer driver."""
+    """Return the Drawer-less state-machine node (tidyup_sm1)."""
     return Node(
         package='teamd_tidyup_pkg',
         executable='tidyup_sm1',
@@ -84,12 +82,39 @@ def create_tidyup_sm_node():
         # the deterministic odom driver even though the PUMAS bridge exposes
         # /move_base/move. Room-to-room states use NavModule and are
         # unaffected.
-        additional_env={'CARROBO_BASE_DRIVER': 'odom'},
+        additional_env={
+            'CARROBO_BASE_DRIVER': 'odom',
+            # This launch file completes localization synchronization before
+            # starting tidyup_sm1. Avoid doing the same reset a second time in
+            # the executable's direct-run safety path.
+            'CARROBO_SKIP_LOCALIZATION_SYNC': '1',
+        },
     )
 
 
 def generate_launch_description():
     """片付けタスクに必要なノードの LaunchDescription を返す."""
+    wait_for_localization = ExecuteProcess(
+        cmd=[
+            'ros2',
+            'topic',
+            'echo',
+            '--once',
+            '--qos-reliability',
+            'reliable',
+            '--qos-durability',
+            'volatile',
+            '--field',
+            'header.stamp',
+            '/rtabmap/info',
+            'rtabmap_msgs/msg/Info',
+        ],
+        output='screen',
+        condition=IfCondition(
+            LaunchConfiguration('reset_world_on_start')
+        ),
+    )
+
     reset_world = ExecuteProcess(
         cmd=[
             'ros2',
@@ -105,12 +130,80 @@ def generate_launch_description():
         ),
     )
 
-    start_after_reset = RegisterEventHandler(
+    republish_initial_pose = ExecuteProcess(
+        cmd=[
+            'ros2',
+            'topic',
+            'pub',
+            '--times',
+            '3',
+            '--rate',
+            '5',
+            '--wait-matching-subscriptions',
+            '1',
+            '--qos-reliability',
+            'reliable',
+            '--qos-durability',
+            'volatile',
+            '--use-sim-time',
+            '--print',
+            '0',
+            '/initialpose',
+            'geometry_msgs/msg/PoseWithCovarianceStamped',
+            INITIAL_POSE,
+        ],
+        output='screen',
+        condition=IfCondition(
+            LaunchConfiguration('reset_world_on_start')
+        ),
+    )
+
+    reset_after_localization_ready = RegisterEventHandler(
+        OnProcessExit(
+            target_action=wait_for_localization,
+            on_exit=[
+                LogInfo(
+                    msg=(
+                        'RTAB-Map is ready. Resetting Isaac and localization.'
+                    )
+                ),
+                reset_world,
+            ],
+        ),
+        condition=IfCondition(
+            LaunchConfiguration('reset_world_on_start')
+        ),
+    )
+
+    republish_pose_after_reset = RegisterEventHandler(
         OnProcessExit(
             target_action=reset_world,
             on_exit=[
                 TimerAction(
                     period=3.0,
+                    actions=[
+                        LogInfo(
+                            msg=(
+                                'Fresh odometry is ready. Republishing the '
+                                'initial pose.'
+                            )
+                        ),
+                        republish_initial_pose,
+                    ],
+                )
+            ],
+        ),
+        condition=IfCondition(
+            LaunchConfiguration('reset_world_on_start')
+        ),
+    )
+
+    start_after_pose_sync = RegisterEventHandler(
+        OnProcessExit(
+            target_action=republish_initial_pose,
+            on_exit=[
+                TimerAction(
+                    period=2.0,
                     actions=[create_tidyup_sm_node()],
                 )
             ],
@@ -151,7 +244,7 @@ def generate_launch_description():
                 'model_path',
                 default_value=DEFAULT_MODEL_PATH,
                 description=(
-                    '物体検出の重みファイル (既定: YOLOE 11s segmentation)'
+                    '物体検出の重みファイル (既定: 2_yolov11s_10.pt)'
                 ),
             ),
             DeclareLaunchArgument(
@@ -198,10 +291,18 @@ def generate_launch_description():
                 name='pumas_navigation_bridge',
                 output='screen',
             ),
-            # Register before launching the short-lived service process so its
-            # exit event cannot be missed.
-            start_after_reset,
-            reset_world,
+            # Register all process-exit handlers before starting the
+            # short-lived readiness check so no exit event can be missed.
+            start_after_pose_sync,
+            republish_pose_after_reset,
+            reset_after_localization_ready,
+            LogInfo(
+                msg='Waiting for RTAB-Map localization before world reset...',
+                condition=IfCondition(
+                    LaunchConfiguration('reset_world_on_start')
+                ),
+            ),
+            wait_for_localization,
             start_without_reset,
         ]
     )
