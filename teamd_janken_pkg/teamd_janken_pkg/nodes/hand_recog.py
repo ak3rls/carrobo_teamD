@@ -98,12 +98,45 @@ class HandRecogNode(Node):
 
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
+                self.lm = hand_landmarks.landmark
+
+                hand_sign = "judge,,,"
+
+                index_extended = self.lm[8].y < self.lm[6].y
+                middle_extended = self.lm[12].y < self.lm[10].y
+                ring_extended = self.lm[16].y < self.lm[14].y
+                pinky_extended = self.lm[20].y < self.lm[18].y
+
+                extended_count = sum(
+                    [index_extended, middle_extended, ring_extended, pinky_extended]
+                )
+
+                if extended_count == 0:
+                    hand_sign = "gu"
+                elif extended_count == 2 and index_extended and middle_extended:
+                    hand_sign = "kyoki"
+                elif extended_count >= 4:
+                    hand_sign = "pa"
+                else:
+                    hand_sign = "judge,,,"
+
                 self.mp_drawing.draw_landmarks(
                     frame,
                     hand_landmarks,
                     self.mp_hands.HAND_CONNECTIONS,
                 )
 
+
+            cv2.putText(
+                frame,
+                f"Te: {hand_sign}",
+                (30,70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.5,
+                (0, 255, 0),
+                3,
+                cv2.LINE_AA,
+            )
         if self.show_image:
             cv2.imshow(WINDOW_NAME, frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
