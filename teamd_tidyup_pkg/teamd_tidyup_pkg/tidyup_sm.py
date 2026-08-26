@@ -13,17 +13,19 @@ from yasmin_viewer import YasminViewerPub
 
 from carrobo_manipulation_pkg.hsrif import HSRInterfaces
 
+from .states.drawer_open import DrawerOpenTask
+from .states.drawer_open import OpenDrawersState
 from .states.grasp import GraspState
+from .states.move_to_box import Move2BoxState
 from .states.move_to_grasp_point import Move2GraspPointState
-from .states.move_to_place_point import Move2PlacePointState
 from .states.move_to_room import Move2RoomState
 from .states.place import PlaceState
 from .states.recog import RecogState
-from .states.drawer_open import DrawerOpenTask, OpenDrawersState
+from .states.select_next_room import SelectNextRoomState
 
 
 class TidyupStateMachineNode(Node):
-    """片付けの5ステートを構築して実行する ROS 2 ノード."""
+    """片付けステートマシンを構築して実行する ROS 2 ノード."""
 
     def __init__(self):
         """ロボットインターフェースとステートマシンを初期化する."""
@@ -36,11 +38,29 @@ class TidyupStateMachineNode(Node):
         # Recog でカメラ座標系から base_link へ変換するために使います。
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.drawer_task = DrawerOpenTask(
+            self,
+            hsrif=self.hsrif,
+            tf_buffer=self.tf_buffer,
+        )
 
         self.state_machine = StateMachine(outcomes=['SUCCEEDED', 'FAILED'])
         self.state_machine.add_state(
-            name='Move2GraspPoint',
-            state=Move2GraspPointState(self, self.nav),
+            name='Drawer',
+            state=OpenDrawersState(self, self.drawer_task),
+            transitions={
+                'succeeded': 'MoveRoomF2A',
+                'failed': 'FAILED',
+            },
+        )
+        self.state_machine.add_state(
+            name='MoveRoomF2A',
+            state=Move2RoomState(
+                self,
+                self.nav,
+                source_room='roomF',
+                target_room='roomA',
+            ),
             transitions={
                 'succeeded': 'Recog',
                 'failed': 'FAILED',
@@ -51,6 +71,16 @@ class TidyupStateMachineNode(Node):
             state=RecogState(self, self.hsrif, self.tf_buffer),
             transitions={
                 'succeeded': 'Grasp',
+                'failed': 'Recog',
+                'none': 'SelectNextRoom',
+            },
+        )
+        self.state_machine.add_state(
+            name='SelectNextRoom',
+            state=SelectNextRoomState(self),
+            transitions={
+                'move_to_room_b': 'MoveRoomA2B',
+                'finished': 'SUCCEEDED',
                 'failed': 'FAILED',
             },
         )
@@ -58,13 +88,13 @@ class TidyupStateMachineNode(Node):
             name='Grasp',
             state=GraspState(self, self.hsrif),
             transitions={
-                'succeeded': 'Move2PlacePoint',
-                'failed': 'FAILED',
+                'succeeded': 'Move2Box',
+                'failed': 'Recog',
             },
         )
         self.state_machine.add_state(
-            name='Move2PlacePoint',
-            state=Move2PlacePointState(self, self.nav),
+            name='Move2Box',
+            state=Move2BoxState(self, self.nav),
             transitions={
                 'succeeded': 'Place',
                 'failed': 'FAILED',
@@ -78,29 +108,25 @@ class TidyupStateMachineNode(Node):
                 'failed': 'FAILED',
             },
         )
-        #drawerのステートマシン
-        # self.state_machine.add_state(
-        #     name='drawer',
-        #     state=drawerawerState(self),
-        #     transitions={
-        #         'succeeded': 'Move2GraspPoint',
-        #     }
-        # )
-
         self.state_machine.add_state(
-            name='MoveRoomF2B',
-            state=Move2RoomState(self, self.nav, source_room='roomF', target_room='roomA'),
+            name='Move2GraspPoint',
+            state=Move2GraspPointState(self, self.nav),
             transitions={
-                'succeeded': 'Move2GraspPoint',
+                'succeeded': 'Recog',
                 'failed': 'FAILED',
             },
         )
 
         self.state_machine.add_state(
-            name='MoveRoomB2A',
-            state=Move2RoomState(self, self.nav, source_room='roomA', target_room='roomB'),
+            name='MoveRoomA2B',
+            state=Move2RoomState(
+                self,
+                self.nav,
+                source_room='roomA',
+                target_room='roomB',
+            ),
             transitions={
-                'succeeded': 'Move2GraspPoint',
+                'succeeded': 'Recog',
                 'failed': 'FAILED',
             },
         )

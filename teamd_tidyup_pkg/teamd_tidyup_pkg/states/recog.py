@@ -32,6 +32,7 @@ CONFIDENCE_THRESHOLD = 0.25
 MAX_GRASP_DISTANCE = 2.0
 TALL_THRESHOLD = 0.15
 HEAD_TILT = math.radians(-50.0)
+MAX_EMPTY_DETECTIONS = 3
 
 
 class RecogState(State):
@@ -44,10 +45,11 @@ class RecogState(State):
         tf_buffer: Buffer,
     ):
         """サービスクライアントを生成する."""
-        super().__init__(outcomes=['succeeded', 'failed'])
+        super().__init__(outcomes=['succeeded', 'failed', 'none'])
         self.node = node
         self.hsrif = hsrif
         self.tf_buffer = tf_buffer
+        self.empty_detection_count = 0
 
         self.detect_client = self.node.create_client(
             ObjectDetectionService, '/yolov8_detection/service'
@@ -121,9 +123,23 @@ class RecogState(State):
 
         index = self._select_target(detections)
         if index < 0:
+            self.empty_detection_count += 1
             target = TARGET_NAME or '物体'
-            self.node.get_logger().error(f'{target} が見つかりません。')
+            self.node.get_logger().warning(
+                f'{target} が見つかりません '
+                f'({self.empty_detection_count}/{MAX_EMPTY_DETECTIONS})。'
+            )
+            if self.empty_detection_count >= MAX_EMPTY_DETECTIONS:
+                self.empty_detection_count = 0
+                self.node.get_logger().info(
+                    f'{MAX_EMPTY_DETECTIONS}回連続で物体を検出できなかったため、'
+                    'none を返します。'
+                )
+                return 'none'
             return 'failed'
+
+        # 物体を検出できた場合、連続未検出回数をリセットします。
+        self.empty_detection_count = 0
         if index >= len(detections.segments):
             self.node.get_logger().error(
                 '検出物体に対応するマスクがありません。'

@@ -511,6 +511,7 @@ class DrawerOpenTask:
         whole_body = None
         original_linear_weight = None
         original_angular_weight = None
+        manipulation_started = False
         try:
             if require_full_sequence:
                 self._validate_full_sequence()
@@ -543,6 +544,7 @@ class DrawerOpenTask:
                 raise RuntimeError("drawer_level は 'bottom' または 'upper' にしてください。")
             contact_only = bool(self._value('contact_only'))
             if bool(self._value('prepare_only')) or contact_only:
+                manipulation_started = True
                 self._prepare_straight_arm(drawer_level, close_hand=not contact_only)
             if bool(self._value('prepare_only')):
                 self.get_logger().info(
@@ -555,7 +557,9 @@ class DrawerOpenTask:
                 self._release_and_retreat(return_to_go=False)
                 return True
             if drawer_level == 'upper':
+                manipulation_started = True
                 return self._open_one_drawer('upper')
+            manipulation_started = True
             if not self._open_one_drawer('bottom'):
                 return False
             if bool(self._value('open_upper_after_lower')):
@@ -591,7 +595,11 @@ class DrawerOpenTask:
         except Exception as error:
             self.get_logger().error(f'引き出し操作に失敗しました: {error}')
             try:
-                if self.hsrif is not None:
+                self.stop_base()
+            except Exception as stop_error:
+                self.get_logger().error(f'台車の停止にも失敗しました: {stop_error}')
+            try:
+                if self.hsrif is not None and manipulation_started:
                     self._release_and_retreat()
             except Exception as retreat_error:
                 self.get_logger().error(f'退避にも失敗しました: {retreat_error}')

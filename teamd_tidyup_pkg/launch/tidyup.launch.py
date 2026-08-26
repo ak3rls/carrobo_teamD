@@ -7,17 +7,12 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import OpaqueFunction
+from launch.actions import TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-
-from teamd_tidyup_pkg.states.drawer_open import (
-    DRAWER_PARAMETER_DEFAULTS,
-    launch_default,
-)
-
 
 _WORKSPACE = os.environ.get(
     'COLCON_WORKSPACE', os.path.expanduser('~/hma2_ws')
@@ -133,10 +128,21 @@ def generate_launch_description():
                 condition=IfCondition(LaunchConfiguration('use_yasmin_viewer')),
             ),
             Node(
-                package='teamd_tidyup_pkg',
-                executable='tidyup_sm',
-                name='teamd_tidyup',
+                package='carrobo_manipulation_pkg',
+                executable='pumas_navigation_bridge',
+                name='pumas_navigation_bridge',
                 output='screen',
+            ),
+            TimerAction(
+                period=3.0,
+                actions=[
+                    Node(
+                        package='teamd_tidyup_pkg',
+                        executable='tidyup_sm',
+                        name='teamd_tidyup',
+                        output='screen',
+                    ),
+                ],
             ),
         ]
     )
