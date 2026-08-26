@@ -41,6 +41,7 @@ setup(
     entry_points={
         'console_scripts': [
             'tidyup_sm = teamd_tidyup_pkg.tidyup_sm:main',
+            'tidyup_sm1 = teamd_tidyup_pkg.tidyup_sm1:main',
             'open_drawer = teamd_tidyup_pkg.states.drawer_open:main',
             (
                 'yoloe_detection_service = '

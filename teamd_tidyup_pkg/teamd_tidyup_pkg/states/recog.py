@@ -5,9 +5,11 @@
 import math
 import time
 
+import numpy as np
 import rclpy
 import tf2_geometry_msgs  # noqa: F401
 import tf_transformations as tft
+from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Quaternion
 from grasp_point_detection_interfaces.srv import GraspPointService
@@ -24,12 +26,16 @@ from carrobo_manipulation_pkg.hsrif import HSRInterfaces
 
 # 掴みたい物体名を指定します。
 # 既存の把持例と同じ対象を初期値にしています。
-# 空文字にすると最もスコアが高い物体を選びます。
+# 空文字にするとロボットから最も近い物体を選びます。
 # ロボット自身を選ぶ可能性があるため、通常は物体名を指定してください。
 TARGET_NAME = ''
 
 CONFIDENCE_THRESHOLD = 0.25
 MAX_GRASP_DISTANCE = 2.0
+DEPTH_SCALES = {
+    '16UC1': 0.001,
+    '32FC1': 1.0,
+}
 TALL_THRESHOLD = 0.15
 HEAD_TILT = math.radians(-50.0)
 MAX_EMPTY_DETECTIONS = 3
@@ -50,6 +56,7 @@ class RecogState(State):
         self.hsrif = hsrif
         self.tf_buffer = tf_buffer
         self.empty_detection_count = 0
+        self.bridge = CvBridge()
 
         self.detect_client = self.node.create_client(
             ObjectDetectionService, '/yolov8_detection/service'
@@ -68,17 +75,133 @@ class RecogState(State):
             )
         return False
 
-    @staticmethod
-    def _select_target(detections) -> int:
-        """対象名に一致する検出のうち、最も高スコアな添字を返す."""
-        candidates = [
-            (index, bbox.score)
+    def _select_target(self, detections) -> int:
+        """対象名に一致する検出のうち、ロボットに最も近い添字を返す."""
+        candidate_indices = [
+            index
             for index, bbox in enumerate(detections.bbox)
             if not TARGET_NAME or bbox.name == TARGET_NAME
         ]
+        if not candidate_indices:
+            return -1
+
+        depth_scale = DEPTH_SCALES.get(detections.depth.encoding)
+        if depth_scale is None:
+            self.node.get_logger().error(
+                '最も近い物体の選択では未対応の'
+                '深度エンコーディングです: '
+                f'{detections.depth.encoding}'
+            )
+            return -1
+
+        try:
+            depth = self.bridge.imgmsg_to_cv2(
+                detections.depth,
+                desired_encoding=detections.depth.encoding,
+            ).astype(np.float64) * depth_scale
+        except Exception as error:  # cv_bridge の例外型は環境で異なる
+            self.node.get_logger().error(
+                f'距離選択用の深度画像を変換できませんでした: {error}'
+            )
+            return -1
+
+        k = detections.camera_info.k
+        fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+        if fx == 0.0 or fy == 0.0:
+            self.node.get_logger().error(
+                '距離選択に必要な camera_info が空です。'
+            )
+            return -1
+
+        candidates = []
+        for index in candidate_indices:
+            bbox = detections.bbox[index]
+            if index >= len(detections.segments):
+                self.node.get_logger().warning(
+                    f'{bbox.name} に対応するマスクがありません。'
+                )
+                continue
+
+            try:
+                mask = self.bridge.imgmsg_to_cv2(
+                    detections.segments[index],
+                    desired_encoding='mono8',
+                )
+            except Exception as error:  # cv_bridge の例外型は環境で異なる
+                self.node.get_logger().warning(
+                    f'{bbox.name} のマスクを変換できませんでした: {error}'
+                )
+                continue
+
+            if depth.shape[:2] != mask.shape[:2]:
+                self.node.get_logger().warning(
+                    f'{bbox.name} の深度画像 {depth.shape[:2]} と'
+                    f'マスク {mask.shape[:2]} の解像度が異なります。'
+                )
+                continue
+
+            valid = (
+                (mask != 0)
+                & np.isfinite(depth)
+                & (depth > 0.0)
+                & (depth <= MAX_GRASP_DISTANCE)
+            )
+            ys, xs = np.nonzero(valid)
+            if ys.size == 0:
+                self.node.get_logger().warning(
+                    f'{bbox.name} の有効な深度を取得できませんでした。'
+                )
+                continue
+
+            distances = depth[ys, xs]
+            median = float(np.median(distances))
+            mad = float(np.median(np.abs(distances - median))) * 1.4826
+            inliers = np.abs(distances - median) <= max(3.0 * mad, 0.005)
+            distances = distances[inliers]
+            xs = xs[inliers]
+            ys = ys[inliers]
+
+            camera_x = np.mean((xs - cx) * distances / fx)
+            camera_y = np.mean((ys - cy) * distances / fy)
+            camera_z = np.mean(distances)
+
+            stamped = PoseStamped()
+            stamped.header = detections.camera_info.header
+            stamped.pose.position.x = float(camera_x)
+            stamped.pose.position.y = float(camera_y)
+            stamped.pose.position.z = float(camera_z)
+            stamped.pose.orientation.w = 1.0
+            try:
+                base_pose = self.tf_buffer.transform(
+                    stamped,
+                    'base_link',
+                    timeout=Duration(seconds=2.0),
+                ).pose
+            except TransformException as error:
+                self.node.get_logger().warning(
+                    f'{bbox.name} の距離を base_link 基準に変換'
+                    f'できませんでした: {error}'
+                )
+                continue
+
+            position = base_pose.position
+            distance = math.sqrt(
+                position.x ** 2 + position.y ** 2 + position.z ** 2
+            )
+            self.node.get_logger().info(
+                f'把持候補 {bbox.name}: ロボットから {distance:.3f} m'
+            )
+            candidates.append((distance, index))
+
         if not candidates:
             return -1
-        return max(candidates, key=lambda item: item[1])[0]
+
+        distance, index = min(candidates, key=lambda item: item[0])
+        self.node.get_logger().info(
+            f'最も近い物体 {detections.bbox[index].name} '
+            f'({distance:.3f} m) を選択しました。'
+        )
+        return index
 
     def execute(self, blackboard: Blackboard) -> str:
         """対象物体を認識し、把持前姿勢を Blackboard に保存する."""

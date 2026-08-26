@@ -7,7 +7,6 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import ExecuteProcess
-from launch.actions import LogInfo
 from launch.actions import OpaqueFunction
 from launch.actions import RegisterEventHandler
 from launch.actions import TimerAction
@@ -30,11 +29,6 @@ DEFAULT_MODEL_PATH = os.path.join(
     'models',
     'yoloe',
     'yoloe-11s-seg.pt',
-)
-INITIAL_POSE = (
-    '{header: {stamp: now, frame_id: map}, pose: {pose: {'
-    'position: {x: 0.0, y: 0.0, z: 0.0}, '
-    'orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}'
 )
 
 
@@ -83,46 +77,19 @@ def create_tidyup_sm_node():
     """Return the state-machine node with the calibrated drawer driver."""
     return Node(
         package='teamd_tidyup_pkg',
-        executable='tidyup_sm',
+        executable='tidyup_sm1',
         name='teamd_tidyup',
         output='screen',
         # The calibrated drawer approach uses odom-frame waypoints. Keep it on
         # the deterministic odom driver even though the PUMAS bridge exposes
         # /move_base/move. Room-to-room states use NavModule and are
         # unaffected.
-        additional_env={
-            'CARROBO_BASE_DRIVER': 'odom',
-            # This launch file completes localization synchronization before
-            # starting tidyup_sm. Avoid doing the same reset a second time in
-            # the executable's direct-run safety path.
-            'CARROBO_SKIP_LOCALIZATION_SYNC': '1',
-        },
+        additional_env={'CARROBO_BASE_DRIVER': 'odom'},
     )
 
 
 def generate_launch_description():
     """片付けタスクに必要なノードの LaunchDescription を返す."""
-    wait_for_localization = ExecuteProcess(
-        cmd=[
-            'ros2',
-            'topic',
-            'echo',
-            '--once',
-            '--qos-reliability',
-            'reliable',
-            '--qos-durability',
-            'volatile',
-            '--field',
-            'header.stamp',
-            '/rtabmap/info',
-            'rtabmap_msgs/msg/Info',
-        ],
-        output='screen',
-        condition=IfCondition(
-            LaunchConfiguration('reset_world_on_start')
-        ),
-    )
-
     reset_world = ExecuteProcess(
         cmd=[
             'ros2',
@@ -138,80 +105,12 @@ def generate_launch_description():
         ),
     )
 
-    republish_initial_pose = ExecuteProcess(
-        cmd=[
-            'ros2',
-            'topic',
-            'pub',
-            '--times',
-            '3',
-            '--rate',
-            '5',
-            '--wait-matching-subscriptions',
-            '1',
-            '--qos-reliability',
-            'reliable',
-            '--qos-durability',
-            'volatile',
-            '--use-sim-time',
-            '--print',
-            '0',
-            '/initialpose',
-            'geometry_msgs/msg/PoseWithCovarianceStamped',
-            INITIAL_POSE,
-        ],
-        output='screen',
-        condition=IfCondition(
-            LaunchConfiguration('reset_world_on_start')
-        ),
-    )
-
-    reset_after_localization_ready = RegisterEventHandler(
-        OnProcessExit(
-            target_action=wait_for_localization,
-            on_exit=[
-                LogInfo(
-                    msg=(
-                        'RTAB-Map is ready. Resetting Isaac and localization.'
-                    )
-                ),
-                reset_world,
-            ],
-        ),
-        condition=IfCondition(
-            LaunchConfiguration('reset_world_on_start')
-        ),
-    )
-
-    republish_pose_after_reset = RegisterEventHandler(
+    start_after_reset = RegisterEventHandler(
         OnProcessExit(
             target_action=reset_world,
             on_exit=[
                 TimerAction(
                     period=3.0,
-                    actions=[
-                        LogInfo(
-                            msg=(
-                                'Fresh odometry is ready. Republishing the '
-                                'initial pose.'
-                            )
-                        ),
-                        republish_initial_pose,
-                    ],
-                )
-            ],
-        ),
-        condition=IfCondition(
-            LaunchConfiguration('reset_world_on_start')
-        ),
-    )
-
-    start_after_pose_sync = RegisterEventHandler(
-        OnProcessExit(
-            target_action=republish_initial_pose,
-            on_exit=[
-                TimerAction(
-                    period=2.0,
                     actions=[create_tidyup_sm_node()],
                 )
             ],
@@ -299,18 +198,10 @@ def generate_launch_description():
                 name='pumas_navigation_bridge',
                 output='screen',
             ),
-            # Register all process-exit handlers before starting the
-            # short-lived readiness check so no exit event can be missed.
-            start_after_pose_sync,
-            republish_pose_after_reset,
-            reset_after_localization_ready,
-            LogInfo(
-                msg='Waiting for RTAB-Map localization before world reset...',
-                condition=IfCondition(
-                    LaunchConfiguration('reset_world_on_start')
-                ),
-            ),
-            wait_for_localization,
+            # Register before launching the short-lived service process so its
+            # exit event cannot be missed.
+            start_after_reset,
+            reset_world,
             start_without_reset,
         ]
     )
