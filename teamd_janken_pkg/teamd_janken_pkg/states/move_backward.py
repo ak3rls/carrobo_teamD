@@ -8,7 +8,7 @@ from yasmin import Blackboard
 from yasmin import State
 
 
-class MoveForwardState(State):
+class MovebackwardState(State):
     """ロボットを1 m後退させるステート."""
 
     def __init__(self, node: Node, nav: NavModule):
