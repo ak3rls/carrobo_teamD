@@ -36,6 +36,7 @@ setup(
         'console_scripts': [
             'janken_sm = teamd_janken_pkg.janken_sm:main',
             'hand_recog = teamd_janken_pkg.nodes.hand_recog:main',
+            'JankenRobot = teamd_janken_pkg.nodes.jyanken_robot_node:main',
         ],
     },
 )
