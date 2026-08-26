@@ -6,9 +6,12 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.actions import ExecuteProcess
 from launch.actions import OpaqueFunction
+from launch.actions import RegisterEventHandler
 from launch.actions import TimerAction
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
+from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
@@ -70,10 +73,70 @@ def yoloe_detection_actions(context, *args, **kwargs):
     ]
 
 
+def create_tidyup_sm_node():
+    """Return the state-machine node with the calibrated drawer driver."""
+    return Node(
+        package='teamd_tidyup_pkg',
+        executable='tidyup_sm',
+        name='teamd_tidyup',
+        output='screen',
+        # The calibrated drawer approach uses odom-frame waypoints. Keep it on
+        # the deterministic odom driver even though the PUMAS bridge exposes
+        # /move_base/move. Room-to-room states use NavModule and are
+        # unaffected.
+        additional_env={'CARROBO_BASE_DRIVER': 'odom'},
+    )
+
+
 def generate_launch_description():
     """片付けタスクに必要なノードの LaunchDescription を返す."""
+    reset_world = ExecuteProcess(
+        cmd=[
+            'ros2',
+            'service',
+            'call',
+            '/isaac/reset_world',
+            'std_srvs/srv/Empty',
+            '{}',
+        ],
+        output='screen',
+        condition=IfCondition(
+            LaunchConfiguration('reset_world_on_start')
+        ),
+    )
+
+    start_after_reset = RegisterEventHandler(
+        OnProcessExit(
+            target_action=reset_world,
+            on_exit=[
+                TimerAction(
+                    period=3.0,
+                    actions=[create_tidyup_sm_node()],
+                )
+            ],
+        ),
+        condition=IfCondition(
+            LaunchConfiguration('reset_world_on_start')
+        ),
+    )
+
+    start_without_reset = TimerAction(
+        period=3.0,
+        actions=[create_tidyup_sm_node()],
+        condition=UnlessCondition(
+            LaunchConfiguration('reset_world_on_start')
+        ),
+    )
+
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                'reset_world_on_start',
+                default_value='true',
+                description=(
+                    'Isaacとlocalizationを同期するため、開始時にworldをresetするか'
+                ),
+            ),
             DeclareLaunchArgument(
                 'use_rviz',
                 default_value='false',
@@ -125,7 +188,9 @@ def generate_launch_description():
                 executable='yasmin_viewer_node',
                 name='yasmin_viewer',
                 output='screen',
-                condition=IfCondition(LaunchConfiguration('use_yasmin_viewer')),
+                condition=IfCondition(
+                    LaunchConfiguration('use_yasmin_viewer')
+                ),
             ),
             Node(
                 package='carrobo_manipulation_pkg',
@@ -133,16 +198,10 @@ def generate_launch_description():
                 name='pumas_navigation_bridge',
                 output='screen',
             ),
-            TimerAction(
-                period=3.0,
-                actions=[
-                    Node(
-                        package='teamd_tidyup_pkg',
-                        executable='tidyup_sm',
-                        name='teamd_tidyup',
-                        output='screen',
-                    ),
-                ],
-            ),
+            # Register before launching the short-lived service process so its
+            # exit event cannot be missed.
+            start_after_reset,
+            reset_world,
+            start_without_reset,
         ]
     )
