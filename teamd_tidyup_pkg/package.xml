@@ -16,6 +16,12 @@
   <depend>carrobo_manipulation_pkg</depend>
   <depend>yolov8_detection_interfaces</depend>
   <depend>grasp_point_detection_interfaces</depend>
+  <depend>hma_object_detection2_interfaces</depend>
+  <depend>std_srvs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>python3-opencv</depend>
+  <depend>python3-numpy</depend>
 
   <exec_depend>yasmin</exec_depend>
   <exec_depend>yasmin_msgs</exec_depend>
@@ -26,6 +32,9 @@
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>yolov8_detection</exec_depend>
   <exec_depend>grasp_point_detection</exec_depend>
+  <exec_depend>hma_object_detection2</exec_depend>
+  <exec_depend>rex_omni_ros2</exec_depend>
+  <exec_depend>hma_grounding_dino2</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -35,6 +35,7 @@ setup(
     entry_points={
         'console_scripts': [
             'janken_sm = teamd_janken_pkg.janken_sm:main',
+            'hand_recog = teamd_janken_pkg.nodes.hand_recog:main',
         ],
     },
 )
