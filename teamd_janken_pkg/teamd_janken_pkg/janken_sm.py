@@ -17,7 +17,7 @@ from yasmin_viewer import YasminViewerPub
 from yasmin import Blackboard, StateMachine
 
 from .config import START_ALIASES, THROW_ALIASES
-from .states import linear, move_backward, move_forward
+from .states import linear, move_backward, move_forward, janken
 from .nodes import hand_recog, jyanken_robot_node
 
 
@@ -37,11 +37,12 @@ class JankenStateMachine(Node):
             name = "LISTENER",
             state = linear.Whisper_state(self),
             transitions = {
-                "success": ""
+                "success": "JANKEN"
             }
         )
         sm.add_state(
             name = "JANKEN",
+            state = 
             
         )
         sm.add_state(

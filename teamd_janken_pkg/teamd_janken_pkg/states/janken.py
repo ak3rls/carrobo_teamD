@@ -3,6 +3,7 @@
 from rclpy.node import Node
 from yasmin import Blackboard
 from yasmin import State
+from teamd_janken_interfaces.srv import hand_recog
 
 
 class JankenState(State):
@@ -18,8 +19,19 @@ class JankenState(State):
     }
 
     def __init__(self, node: Node):
-        super().__init__(outcomes=['win', 'lose', 'draw', 'failed'])
+        super().__init__(outcomes=['win', 'lose', 'failed'])
         self.node = node
+
+        self.cli = self.create_client(hand_recog, "hand_recog_jg")
+        while not self.cli.wait_for_service(timeout_sec = 1.0):
+            self.get_logger().info("サーバーがひらくのを待ってます")
+        self.req = hand_recog.Request()
+
+    def send_request_hand(self, kara: int):
+        self.req. = int(kara)
+        future = self.cli.call_async(self.req)
+        rclpy.spin_until_future_complete(self, future)
+        return future.result()
 
     def execute(self, blackboard: Blackboard) -> str:
         """ロボット視点の勝敗を返す."""

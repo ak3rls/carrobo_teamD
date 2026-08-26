@@ -1,0 +1,10 @@
+string request_id
+string action
+string choice
+---
+string request_id
+string action
+string status
+string message
+string choice
+

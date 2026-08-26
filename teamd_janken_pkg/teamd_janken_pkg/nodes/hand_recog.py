@@ -5,6 +5,7 @@
 from pathlib import Path
 import site
 import sys
+from teamd_janken_interfaces import hand_recog
 
 
 def _prefer_mediapipe_user_site() -> None:
@@ -41,6 +42,11 @@ class HandRecogNode(Node):
     def __init__(self):
         """ROS パラメータ、MediaPipe、カメラを初期化する."""
         super().__init__('hand_recog')
+        self.srv = self.create_service(
+            hand_recog,
+            "hand_recog_jg",
+            self.
+        )
 
         self.declare_parameter('camera_index', 0)
         self.declare_parameter('show_image', True)
@@ -80,6 +86,9 @@ class HandRecogNode(Node):
             self.get_logger().info(
                 '画像ウィンドウで q を押すと終了します。'
             )
+    def hand_recog_server(self, request ,response):
+        response = self.hand_sign
+        return response
 
     def process_frame(self) -> bool:
         """画像を1フレーム処理し、処理を継続するか返す."""
@@ -100,7 +109,7 @@ class HandRecogNode(Node):
             for hand_landmarks in results.multi_hand_landmarks:
                 self.lm = hand_landmarks.landmark
 
-                hand_sign = "judge,,,"
+                self.hand_sign = "judge,,,"
 
                 index_extended = self.lm[8].y < self.lm[6].y
                 middle_extended = self.lm[12].y < self.lm[10].y
@@ -112,13 +121,13 @@ class HandRecogNode(Node):
                 )
 
                 if extended_count == 0:
-                    hand_sign = "gu"
+                    self.hand_sign = "gu"
                 elif extended_count == 2 and index_extended and middle_extended:
-                    hand_sign = "kyoki"
+                    self.hand_sign = "kyoki"
                 elif extended_count >= 4:
-                    hand_sign = "pa"
+                    self.hand_sign = "pa"
                 else:
-                    hand_sign = "judge,,,"
+                    self.hand_sign = "judge,,,"
 
                 self.mp_drawing.draw_landmarks(
                     frame,
