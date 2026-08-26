@@ -5,20 +5,27 @@
 import math
 import time
 
+import cv2
 import numpy as np
 import rclpy
 import tf2_geometry_msgs  # noqa: F401
 import tf_transformations as tft
-from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Quaternion
 from grasp_point_detection_interfaces.srv import GraspPointService
+from hma_object_detection2_interfaces.srv import (
+    ObjectDetectionService as RexObjectDetectionService,
+)
+from hma_rclpy_extension.cv_bridge import CvBridgeUtils
 from rclpy.duration import Duration
 from rclpy.node import Node
+from std_srvs.srv import Trigger
 from tf2_ros import Buffer
 from tf2_ros import TransformException
 from yasmin import Blackboard
 from yasmin import State
+from yolov8_detection_interfaces.msg import BBox as YoloBBox
+from yolov8_detection_interfaces.msg import ObjectDetection
 from yolov8_detection_interfaces.srv import ObjectDetectionService
 
 from carrobo_manipulation_pkg.hsrif import HSRInterfaces
@@ -39,6 +46,77 @@ DEPTH_SCALES = {
 TALL_THRESHOLD = 0.15
 HEAD_TILT = math.radians(-50.0)
 MAX_EMPTY_DETECTIONS = 3
+REX_OMNI_PROMPT = 'object'
+REX_OMNI_DETECTION_SERVICE = '/rex_omni_sam2/object_detection'
+REX_OMNI_START_SERVICE = '/rex_omni/start'
+REX_OMNI_STOP_SERVICE = '/rex_omni/stop'
+REX_OMNI_SERVICE_TIMEOUT = 10.0
+
+
+def _box_aligned_grasp_orientation(
+    box_orientation: Quaternion,
+    side_grasp: bool,
+    object_xy,
+):
+    """
+    Align the gripper closing axis with the object's horizontal short edge.
+
+    The grasp-point service defines the box-local X axis as the long edge and
+    Y as the short edge.  The HSR hand closes along its local Y axis and
+    approaches along local +Z.
+
+    For a side grasp, the PCA long axis has an arbitrary sign.  Select the
+    sign pointing from the robot toward the object so the pre-grasp offset is
+    placed on the robot-facing end of the object.
+    """
+    box_quaternion = np.array(
+        [
+            box_orientation.x,
+            box_orientation.y,
+            box_orientation.z,
+            box_orientation.w,
+        ],
+        dtype=np.float64,
+    )
+    box_quaternion /= np.linalg.norm(box_quaternion)
+
+    box_rotation = tft.quaternion_matrix(box_quaternion)[:3, :3]
+    long_axis = box_rotation[:, 0].copy()
+    long_axis[2] = 0.0
+    long_axis_norm = np.linalg.norm(long_axis)
+    if long_axis_norm < np.finfo(np.float64).eps:
+        raise ValueError('物体の水平長辺方向を計算できません。')
+    long_axis /= long_axis_norm
+
+    if side_grasp and np.dot(long_axis[:2], object_xy) < 0.0:
+        half_turn = tft.quaternion_from_euler(0.0, 0.0, math.pi)
+        box_quaternion = tft.quaternion_multiply(
+            box_quaternion,
+            half_turn,
+        )
+        long_axis *= -1.0
+
+    if side_grasp:
+        grasp_offset = tft.quaternion_from_euler(
+            math.pi,
+            -math.pi / 2.0,
+            0.0,
+        )
+    else:
+        grasp_offset = tft.quaternion_from_euler(math.pi, 0.0, 0.0)
+
+    grasp_quaternion = tft.quaternion_multiply(
+        box_quaternion,
+        grasp_offset,
+    )
+    grasp_quaternion /= np.linalg.norm(grasp_quaternion)
+    orientation = Quaternion(
+        x=float(grasp_quaternion[0]),
+        y=float(grasp_quaternion[1]),
+        z=float(grasp_quaternion[2]),
+        w=float(grasp_quaternion[3]),
+    )
+    return orientation, long_axis
 
 
 class RecogState(State):
@@ -56,10 +134,22 @@ class RecogState(State):
         self.hsrif = hsrif
         self.tf_buffer = tf_buffer
         self.empty_detection_count = 0
-        self.bridge = CvBridge()
+        self.bridge = CvBridgeUtils()
 
         self.detect_client = self.node.create_client(
             ObjectDetectionService, '/yolov8_detection/service'
+        )
+        self.rex_detect_client = self.node.create_client(
+            RexObjectDetectionService,
+            REX_OMNI_DETECTION_SERVICE,
+        )
+        self.rex_start_client = self.node.create_client(
+            Trigger,
+            REX_OMNI_START_SERVICE,
+        )
+        self.rex_stop_client = self.node.create_client(
+            Trigger,
+            REX_OMNI_STOP_SERVICE,
         )
         self.grasp_client = self.node.create_client(
             GraspPointService, '/grasp_point_detection/service'
@@ -74,6 +164,170 @@ class RecogState(State):
                 f'{service_name} が見つかりません。起動を待っています...'
             )
         return False
+
+    def _wait_for_rex_service(self, client, service_name: str) -> bool:
+        """Rex-Omni関連サービスを有限時間だけ待つ."""
+        if client.wait_for_service(timeout_sec=REX_OMNI_SERVICE_TIMEOUT):
+            return True
+        self.node.get_logger().error(
+            f'{service_name} が {REX_OMNI_SERVICE_TIMEOUT:.0f} 秒以内に'
+            '見つかりませんでした。'
+        )
+        return False
+
+    def _set_rex_model_state(self, start: bool) -> bool:
+        """Rex-Omniモデルをロードまたはアンロードする."""
+        client = self.rex_start_client if start else self.rex_stop_client
+        service_name = (
+            REX_OMNI_START_SERVICE if start else REX_OMNI_STOP_SERVICE
+        )
+        operation = '起動' if start else '停止'
+        if not self._wait_for_rex_service(client, service_name):
+            return False
+
+        future = client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self.node, future)
+        response = future.result()
+        if response is None:
+            self.node.get_logger().error(
+                f'Rex-Omniモデルの{operation}サービスから応答がありません。'
+            )
+            return False
+        if not response.success:
+            self.node.get_logger().error(
+                f'Rex-Omniモデルの{operation}に失敗しました: '
+                f'{response.message}'
+            )
+            return False
+
+        self.node.get_logger().info(
+            f'Rex-Omniモデルの{operation}完了: {response.message}'
+        )
+        return True
+
+    def _convert_rex_detections(self, detections) -> ObjectDetection:
+        """Rex-Omni+SAM2の圧縮画像結果を既存YOLO形式へ変換する."""
+        converted = ObjectDetection()
+        converted.header = detections.header
+        converted.is_detected = detections.is_detected
+        converted.camera_info = detections.camera_info
+
+        if not detections.bbox:
+            return converted
+        if not detections.depth.data:
+            raise ValueError('Rex-Omni検出結果に深度画像がありません。')
+
+        if 'compresseddepth' in detections.depth.format.lower():
+            depth = self.bridge.compressed_imgmsg_to_depth(detections.depth)
+        else:
+            depth = cv2.imdecode(
+                np.frombuffer(detections.depth.data, dtype=np.uint8),
+                cv2.IMREAD_UNCHANGED,
+            )
+        if depth is None:
+            raise ValueError('Rex-Omniの圧縮深度画像を変換できません。')
+        depth = np.asarray(depth)
+        if depth.dtype == np.uint16:
+            depth_encoding = '16UC1'
+        elif depth.dtype == np.float32:
+            depth_encoding = '32FC1'
+        else:
+            raise ValueError(
+                'Rex-Omniの深度画像型に対応していません: '
+                f'{depth.dtype}'
+            )
+
+        converted.depth = self.bridge.cv2_to_imgmsg(
+            depth,
+            encoding=depth_encoding,
+        )
+        converted.depth.header = detections.depth.header
+
+        if len(detections.segments) < len(detections.bbox):
+            raise ValueError(
+                'Rex-Omni検出結果のbbox数よりmask数が少ないです。'
+            )
+
+        for rex_bbox, compressed_mask in zip(
+            detections.bbox,
+            detections.segments,
+        ):
+            bbox = YoloBBox()
+            bbox.id = rex_bbox.id
+            bbox.name = rex_bbox.name
+            bbox.score = rex_bbox.score
+            bbox.x = rex_bbox.x
+            bbox.y = rex_bbox.y
+            bbox.w = rex_bbox.w
+            bbox.h = rex_bbox.h
+            converted.bbox.append(bbox)
+
+            mask = cv2.imdecode(
+                np.frombuffer(compressed_mask.data, dtype=np.uint8),
+                cv2.IMREAD_GRAYSCALE,
+            )
+            if mask is None:
+                raise ValueError(
+                    f'{rex_bbox.name} の圧縮maskを変換できません。'
+                )
+            if mask.shape[:2] != depth.shape[:2]:
+                mask = cv2.resize(
+                    mask,
+                    (depth.shape[1], depth.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            mask_msg = self.bridge.cv2_to_imgmsg(
+                mask.astype(np.uint8),
+                encoding='mono8',
+            )
+            mask_msg.header = compressed_mask.header
+            converted.segments.append(mask_msg)
+
+        return converted
+
+    def _detect_with_rex_omni(self):
+        """Rex-Omniを1視点・1フレームだけ実行する."""
+        if not self._wait_for_rex_service(
+            self.rex_detect_client,
+            REX_OMNI_DETECTION_SERVICE,
+        ):
+            return None
+        if not self._set_rex_model_state(start=True):
+            return None
+
+        try:
+            request = RexObjectDetectionService.Request()
+            request.confidence_th = 0.0
+            request.iou_th = 0.0
+            request.use_latest_image = True
+            request.max_distance = MAX_GRASP_DISTANCE
+            request.specific_id = REX_OMNI_PROMPT
+
+            self.node.get_logger().info(
+                'YOLOで物体を検出できなかったため、'
+                f'Rex-Omniを prompt="{REX_OMNI_PROMPT}" で1回実行します。'
+            )
+            future = self.rex_detect_client.call_async(request)
+            rclpy.spin_until_future_complete(self.node, future)
+            response = future.result()
+            if response is None:
+                self.node.get_logger().error(
+                    'Rex-Omni検出サービスから応答がありません。'
+                )
+                return None
+
+            try:
+                return self._convert_rex_detections(response.detections)
+            except (TypeError, ValueError) as error:
+                self.node.get_logger().error(
+                    f'Rex-Omni検出結果を変換できませんでした: {error}'
+                )
+                return None
+        finally:
+            if not self._set_rex_model_state(start=False):
+                self.node.get_logger().warning(
+                    'Rex-Omniモデルを停止できませんでした。'
+                )
 
     def _select_target(self, detections) -> int:
         """対象名に一致する検出のうち、ロボットに最も近い添字を返す."""
@@ -246,20 +500,51 @@ class RecogState(State):
 
         index = self._select_target(detections)
         if index < 0:
-            self.empty_detection_count += 1
+            self.empty_detection_count = min(
+                self.empty_detection_count + 1,
+                MAX_EMPTY_DETECTIONS,
+            )
             target = TARGET_NAME or '物体'
             self.node.get_logger().warning(
                 f'{target} が見つかりません '
                 f'({self.empty_detection_count}/{MAX_EMPTY_DETECTIONS})。'
             )
             if self.empty_detection_count >= MAX_EMPTY_DETECTIONS:
-                self.empty_detection_count = 0
                 self.node.get_logger().info(
                     f'{MAX_EMPTY_DETECTIONS}回連続で物体を検出できなかったため、'
-                    'none を返します。'
+                    'Rex-Omniで最終確認します。'
                 )
-                return 'none'
-            return 'failed'
+                rex_detections = self._detect_with_rex_omni()
+                if rex_detections is None:
+                    return 'failed'
+
+                rex_names = [bbox.name for bbox in rex_detections.bbox]
+                self.node.get_logger().info(
+                    f'Rex-Omniが検出した物体: {rex_names}'
+                )
+                if not rex_detections.bbox:
+                    self.empty_detection_count = 0
+                    self.node.get_logger().info(
+                        'Rex-Omniでも物体を検出しなかったため、'
+                        'none を返します。'
+                    )
+                    return 'none'
+
+                rex_index = self._select_target(rex_detections)
+                if rex_index < 0:
+                    self.node.get_logger().warning(
+                        'Rex-Omniは物体を検出しましたが、'
+                        '把持可能な深度またはmaskを取得できませんでした。'
+                    )
+                    return 'failed'
+
+                detections = rex_detections
+                index = rex_index
+                self.node.get_logger().info(
+                    'Rex-Omniの検出結果を把持処理へ渡します。'
+                )
+            else:
+                return 'failed'
 
         # 物体を検出できた場合、連続未検出回数をリセットします。
         self.empty_detection_count = 0
@@ -306,23 +591,43 @@ class RecogState(State):
             )
             return 'failed'
 
-        # carrobo_manipulation_pkg の把持例と同じルールで掴む向きを決めます。
+        # 高さで上／横把持を選び、水平の短辺をグリッパで挟みます。
         height = grasp_response.grasp.size.z
+        long_edge = grasp_response.grasp.size.x
+        short_edge = grasp_response.grasp.size.y
+        self.node.get_logger().info(
+            '推定した物体寸法: '
+            f'長辺={long_edge:.3f} m, 短辺={short_edge:.3f} m, '
+            f'高さ={height:.3f} m'
+        )
+
         if height > TALL_THRESHOLD:
-            self.node.get_logger().info('背が高い物体なので横から掴みます。')
-            roll = math.pi
-            pitch = -math.pi / 2.0
-            object_pose.position.x -= 0.1
+            orientation, approach_axis = _box_aligned_grasp_orientation(
+                object_pose.orientation,
+                side_grasp=True,
+                object_xy=(object_pose.position.x, object_pose.position.y),
+            )
+            object_pose.position.x -= 0.1 * approach_axis[0]
+            object_pose.position.y -= 0.1 * approach_axis[1]
             approach = 0.1
+            approach_yaw = math.atan2(approach_axis[1], approach_axis[0])
+            self.node.get_logger().info(
+                '背が高い物体なので、短辺を挟む横把持にします。'
+                f'長辺方向からの接近角={math.degrees(approach_yaw):.1f} deg'
+            )
         else:
-            self.node.get_logger().info('平たい物体なので上から掴みます。')
-            roll = math.pi
-            pitch = 0.0
+            orientation, _ = _box_aligned_grasp_orientation(
+                object_pose.orientation,
+                side_grasp=False,
+                object_xy=(object_pose.position.x, object_pose.position.y),
+            )
             object_pose.position.z += 0.1
             approach = 0.05
+            self.node.get_logger().info(
+                '平たい物体なので、短辺を挟む上把持にします。'
+            )
 
-        qx, qy, qz, qw = tft.quaternion_from_euler(roll, pitch, 0.0)
-        object_pose.orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
+        object_pose.orientation = orientation
 
         blackboard.grasp_pose = object_pose
         blackboard.grasp_approach = approach

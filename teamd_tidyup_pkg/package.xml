@@ -17,6 +17,7 @@
   <depend>yolov8_detection_interfaces</depend>
   <depend>grasp_point_detection_interfaces</depend>
   <depend>hma_object_detection2_interfaces</depend>
+  <depend>hma_rclpy_extension</depend>
   <depend>std_srvs</depend>
   <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>

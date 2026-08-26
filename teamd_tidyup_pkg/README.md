@@ -20,6 +20,38 @@ ros2 launch teamd_tidyup_pkg tidyup.launch.py
 Viewer と本ステートマシンを起動します。
 bring upとnavigation、Issac Simは立ち上げておいてください。
 
+## YOLO未検出時のRex-Omni最終確認
+
+`Recog`はYOLOで3回連続して物体を検出できなかった場合、同じ視点の最新1フレームを
+Rex-Omniへ`object`プロンプトで渡します。Rex-Omniも0件なら`none`を返し、
+物体があればSAM2のmaskとdepthを既存の把持点推定へ渡します。
+
+Rex-Omniは最終確認時だけモデルをロードし、推論後に停止してVRAMを解放します。
+通常は既定のweights位置を使用します。別の場所にある場合は次のように指定します。
+
+```bash
+ros2 launch teamd_tidyup_pkg tidyup.launch.py \
+  rex_omni_weights_dir:=/path/to/weights/Rex-Omni
+```
+
+Rex-Omniを起動しない調整時は`use_rex_omni:=false`を指定できます。ただし、その状態で
+YOLOが3回連続未検出になると、最終確認サービスがないため`Recog`は`failed`を返します。
+
+**Rex-Omniのtokenizer不整合について（2026-08-26に修正済み）**: HuggingFace配布の
+`IDEA-Research/Rex-Omni`の`vocab.json`/`merges.txt`は、ベースモデル
+（`Qwen/Qwen2.5-VL-7B-Instruct`）のものと同一で、独自のbin座標トークン
+（`<0>`〜`<999>`）用に語彙を差し替えるべき箇所が未編集のまま配布されていた。
+このため`AutoTokenizer`で読み込むと`<|im_end|>`等の特殊トークンが埋め込み行列
+（151936行）の範囲を超えるIDに再割当てされ、推論時に
+`CUDA error: device-side assert triggered`でクラッシュしていた。
+
+対処として、ダウンロード先`weights/Rex-Omni/`内の`vocab.json`・`merges.txt`から、
+`tokenizer_config.json`の`added_tokens_decoder`が想定するID範囲
+（150643〜151664）と衝突する末尾1000件（稀少なUnicode BPEトークン）を除去済み
+（元ファイルは同ディレクトリに`*.orig_backup`として保存）。この修正は
+`download_rex_omni_weights`で再ダウンロードすると失われるため、再取得時は再度
+同じ手順（末尾1000件の除去）を行う必要がある。
+
 ## SAM2による引き出し取っ手検出
 
 `drawer_handle_detector`はGroundingDINOへ取っ手名をプロンプトとして渡し、
