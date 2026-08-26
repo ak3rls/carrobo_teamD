@@ -9,11 +9,11 @@ from yasmin import Blackboard
 from yasmin import State
 
 
-
 # 把持場所の map 座標
-GOAL_X = 6.9
-GOAL_Y = 0.56
-GOAL_YAW = 0.0
+GRASP_POINT_GOALS = {
+    'roomA': {'x': 6.960, 'y': -0.950, 'yaw': 0.977},
+    'roomB': {'x': 6.848, 'y':  4.283, 'yaw': -1.060},
+}
 
 # 0.0 は到着するまで待ち続けます。必要なら秒数を指定してください。
 NAVIGATION_TIMEOUT = 0.0
@@ -31,18 +31,37 @@ class Move2GraspPointState(State):
     def execute(self, blackboard: Blackboard) -> str:
         """設定された把持場所へ移動する."""
         self.node.get_logger().info('Executing state Move2GraspPoint')
-
-        if GOAL_X is None or GOAL_Y is None or GOAL_YAW is None:
+        if 'current_room' not in blackboard:
             self.node.get_logger().error(
-                '把持場所が未設定です。move_to_grasp_point.py の '
-                'GOAL_X / GOAL_Y / GOAL_YAW を設定してください。'
+                'Blackboardにcurrent_roomが設定されていません。'
             )
             return 'failed'
 
-        goal = Pose2D(x=float(GOAL_X), y=float(GOAL_Y), theta=float(GOAL_YAW))
+        current_room = blackboard.current_room
+
+        if current_room not in GRASP_POINT_GOALS:
+            self.node.get_logger().error(
+                f'{current_room} の把持場所が設定されていません。'
+            )
+            return 'failed'
+
+        grasp_goal = GRASP_POINT_GOALS[current_room]
+        if grasp_goal['x'] is None or grasp_goal['y'] is None or grasp_goal['yaw'] is None:
+            self.node.get_logger().error(
+                f'{current_room} の把持場所座標が未設定です。'
+            )
+            return 'failed'
+
+        goal = Pose2D(
+            x=float(grasp_goal['x']),
+            y=float(grasp_goal['y']),
+            theta=float(grasp_goal['yaw']),
+        )
+
         self.node.get_logger().info(
-            f'Navigation goal: x={goal.x:.2f}, y={goal.y:.2f}, '
-            f'yaw={goal.theta:.2f}'
+            f'{current_room} grasp goal: '
+            f'x={goal.x:.3f}, y={goal.y:.3f}, '
+            f'yaw={goal.theta:.3f}'
         )
 
         if self.nav.nav_goal(goal=goal, timeout=NAVIGATION_TIMEOUT):

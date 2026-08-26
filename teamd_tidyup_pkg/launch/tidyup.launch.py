@@ -7,12 +7,14 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import ExecuteProcess
+from launch.actions import IncludeLaunchDescription
 from launch.actions import LogInfo
 from launch.actions import OpaqueFunction
 from launch.actions import RegisterEventHandler
 from launch.actions import TimerAction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.event_handlers import OnProcessExit
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
@@ -23,6 +25,12 @@ DEFAULT_MODEL_PATH = PathJoinSubstitution([
     'models',
     '2_yolov11s_10.pt',
 ])
+DRAWER_KNOB_MODEL_PATH = PathJoinSubstitution([
+    FindPackageShare('teamd_tidyup_pkg'),
+    'models',
+    'yoloe-11l-seg.pt',
+])
+
 INITIAL_POSE = (
     '{header: {stamp: now, frame_id: map}, pose: {pose: {'
     'position: {x: 0.0, y: 0.0, z: 0.0}, '
@@ -241,6 +249,18 @@ def generate_launch_description():
                 description='YASMIN Viewer を起動するか',
             ),
             DeclareLaunchArgument(
+                'use_rex_omni',
+                default_value='true',
+                description='YOLO未検出時のRex-Omni最終確認を有効にするか',
+            ),
+            DeclareLaunchArgument(
+                'rex_omni_weights_dir',
+                default_value='',
+                description=(
+                    'Rex-Omni weightsディレクトリ。空なら既定位置を使用する'
+                ),
+            ),
+            DeclareLaunchArgument(
                 'model_path',
                 default_value=DEFAULT_MODEL_PATH,
                 description=(
@@ -270,6 +290,52 @@ def generate_launch_description():
                 description='検出結果画像のpublish先',
             ),
             OpaqueFunction(function=yoloe_detection_actions),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    PathJoinSubstitution([
+                        FindPackageShare('hma_object_detection2'),
+                        'launch',
+                        'hsr_head_rgbd_rex_omni_sam2_service.launch.py',
+                    ])
+                ),
+                launch_arguments={
+                    'rex_omni_action_name': '/rex_omni/infer',
+                    'image_topic': LaunchConfiguration('image_topic'),
+                    'depth_topic': LaunchConfiguration('depth_topic'),
+                    'camera_info_topic': LaunchConfiguration(
+                        'camera_info_topic'
+                    ),
+                    'image_is_compressed': 'false',
+                    'depth_is_compressed': 'false',
+                    'default_prompt': 'object',
+                    'rex_omni_weights_dir': LaunchConfiguration(
+                        'rex_omni_weights_dir'
+                    ),
+                }.items(),
+                condition=IfCondition(LaunchConfiguration('use_rex_omni')),
+            ),
+            Node(
+                package='teamd_tidyup_pkg',
+                executable='drawer_knob_detection_service',
+                name='drawer_knob_detection',
+                output='screen',
+                parameters=[{
+                    'image_topic': LaunchConfiguration('image_topic'),
+                    'camera_info_topic': LaunchConfiguration(
+                        'camera_info_topic'
+                    ),
+                    'depth_topic': LaunchConfiguration('depth_topic'),
+                    'output_topic': '/drawer_knob/output_image',
+                    'model_path': DRAWER_KNOB_MODEL_PATH,
+                }],
+                # The base class always creates yolov8_detection/service, so
+                # the knob detector has to be remapped off the object
+                # detector's name.
+                remappings=[(
+                    'yolov8_detection/service',
+                    '/drawer_knob_detection/service',
+                )],
+            ),
             Node(
                 package='grasp_point_detection',
                 executable='grasp_point_service',

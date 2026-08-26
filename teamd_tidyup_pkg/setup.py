@@ -47,6 +47,10 @@ setup(
                 'yoloe_detection_service = '
                 'teamd_tidyup_pkg.nodes.yoloe_detection_service:main'
             ),
+            (
+                'drawer_knob_detection_service = '
+                'teamd_tidyup_pkg.nodes.drawer_knob_detection_service:main'
+            ),
         ],
     },
 )
