@@ -1,121 +1,75 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""片付けタスクを実行する YASMIN ステートマシン."""
+"""じゃんけんの YASMIN ステートマシンを構築するファイル.
 
-import rclpy
-from navigation_tools.navlib import NavModule
-from rclpy.node import Node
-from tf2_ros import Buffer
-from tf2_ros import TransformListener
-from yasmin import Blackboard
-from yasmin import StateMachine
-from yasmin_viewer import YasminViewerPub
+ROS 通信を担当する ``JankenCoordinatorNode`` と、各ステートをつなぐ
+処理を分離しています。ここを読むとゲームの全体の流れが分かります。
+"""
 
-from carrobo_manipulation_pkg.hsrif import HSRInterfaces
+from yasmin import Blackboard, StateMachine
 
-from .states.grasp import GraspState
-from .states.move_to_grasp_point import Move2GraspPointState
-from .states.move_to_place_point import Move2PlacePointState
-from .states.place import PlaceState
-from .states.recog import RecogState
+from .config import START_ALIASES, THROW_ALIASES
+from .states import (
+    DetectorControlState,
+    FinishState,
+    InitialPoseState,
+    JudgeState,
+    ShowRobotChoiceState,
+    WaitPlayerGestureState,
+    WaitWhisperState,
+)
 
 
-class TidyupStateMachineNode(Node):
-    """片付けの5ステートを構築して実行する ROS 2 ノード."""
+class JankenStateMachine:
+    """じゃんけん 1 回分の状態遷移と blackboard を保持する."""
 
-    def __init__(self):
-        """ロボットインターフェースとステートマシンを初期化する."""
-        super().__init__('teamd_janken')
-
-        # carrobo_nav と carrobo_manipulation_pkg の例と同じインターフェースです。
-        self.nav = NavModule()
-        self.hsrif = HSRInterfaces()
-
-        # Recog でカメラ座標系から base_link へ変換するために使います。
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        self.state_machine = StateMachine(outcomes=['SUCCEEDED', 'FAILED'])
-        self.state_machine.add_state(
-            name='Move2GraspPoint',
-            state=Move2GraspPointState(self, self.nav),
-            transitions={
-                'succeeded': 'Recog',
-                'failed': 'FAILED',
-            },
-        )
-        self.state_machine.add_state(
-            name='Recog',
-            state=RecogState(self, self.hsrif, self.tf_buffer),
-            transitions={
-                'succeeded': 'Grasp',
-                'failed': 'FAILED',
-            },
-        )
-        self.state_machine.add_state(
-            name='Grasp',
-            state=GraspState(self, self.hsrif),
-            transitions={
-                'succeeded': 'Move2PlacePoint',
-                'failed': 'FAILED',
-            },
-        )
-        self.state_machine.add_state(
-            name='Move2PlacePoint',
-            state=Move2PlacePointState(self, self.nav),
-            transitions={
-                'succeeded': 'Place',
-                'failed': 'FAILED',
-            },
-        )
-        self.state_machine.add_state(
-            name='Place',
-            state=PlaceState(self, self.hsrif),
-            transitions={
-                'succeeded': 'Move2GraspPoint',
-                'failed': 'FAILED',
-            },
-        )
-
-        self.viewer = YasminViewerPub(
-            fsm_name='TEAMD_JANKEN',
-            fsm=self.state_machine,
-        )
-
+    def __init__(self, node):
+        self.node = node
         self.blackboard = Blackboard()
-        self.blackboard.grasp_pose = None
-        self.blackboard.grasp_approach = 0.0
-        self.blackboard.target_name = ''
+        # 各ステートが参照する値を初期化します。
+        self.blackboard.robot_choice = None
+        self.blackboard.player_choice = None
+
+        self.fsm = StateMachine(outcomes=['SUCCEEDED', 'FAILED'])
+        self.fsm.add_state(
+            'InitialPose', InitialPoseState(node),
+            {'succeeded': 'WaitStart', 'failed': 'FAILED'},
+        )
+        self.fsm.add_state(
+            'WaitStart',
+            WaitWhisperState(node, START_ALIASES, 'waiting_start_phrase'),
+            {'succeeded': 'EnableMediaPipe', 'failed': 'FAILED'},
+        )
+        self.fsm.add_state(
+            'EnableMediaPipe', DetectorControlState(node, True),
+            {'succeeded': 'WaitThrow', 'failed': 'FAILED'},
+        )
+        self.fsm.add_state(
+            'WaitThrow',
+            WaitWhisperState(node, THROW_ALIASES, 'waiting_throw_phrase'),
+            {'succeeded': 'ShowRobotChoice', 'failed': 'FAILED'},
+        )
+        self.fsm.add_state(
+            'ShowRobotChoice', ShowRobotChoiceState(node),
+            {'succeeded': 'WaitPlayerGesture', 'failed': 'FAILED'},
+        )
+        self.fsm.add_state(
+            'WaitPlayerGesture',
+            WaitPlayerGestureState(node, node.args.gesture_timeout),
+            {'succeeded': 'Judge', 'failed': 'FAILED'},
+        )
+        self.fsm.add_state(
+            'Judge', JudgeState(node),
+            {'succeeded': 'Finish', 'failed': 'FAILED'},
+        )
+        self.fsm.add_state(
+            'Finish', FinishState(node),
+            {'succeeded': 'SUCCEEDED', 'failed': 'FAILED'},
+        )
 
     def run(self) -> str:
-        """ステートマシンを実行し、最終 outcome を返す."""
-        outcome = self.state_machine(blackboard=self.blackboard)
-        self.get_logger().info(f'State machine finished: {outcome}')
+        """YASMIN を実行し、``SUCCEEDED`` または ``FAILED`` を返す."""
+
+        outcome = self.fsm(blackboard=self.blackboard)
+        self.node.get_logger().info('Janken state machine finished: %s' % outcome)
         return outcome
-
-    def cleanup(self):
-        """ナビゲーションと Viewer のバックグラウンド処理を止める."""
-        if self.nav.is_navigating:
-            self.nav.cancel_nav_action()
-        self.nav.shutdown()
-        self.viewer.shutdown()
-
-
-def main(args=None):
-    """ROS 2 を初期化し、片付けステートマシンを実行する."""
-    rclpy.init(args=args)
-    node = TidyupStateMachineNode()
-
-    try:
-        node.run()
-    except KeyboardInterrupt:
-        node.get_logger().info('片付けタスクを中断します。')
-    finally:
-        node.cleanup()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
