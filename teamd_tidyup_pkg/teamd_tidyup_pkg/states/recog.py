@@ -47,6 +47,9 @@ EXCLUDED_NAMES = {
 
 CONFIDENCE_THRESHOLD = 0.6
 MAX_GRASP_DISTANCE = 2.0
+# これより近い物体は把持候補にしません [m]。
+# 足元にあると腕を振り込めず、台車やロボット自身と干渉します。
+MIN_GRASP_DISTANCE = 0.8
 DEPTH_SCALES = {
     '16UC1': 0.001,
     '32FC1': 1.0,
@@ -987,6 +990,14 @@ class RecogState(State):
             distance = math.sqrt(
                 position.x ** 2 + position.y ** 2 + position.z ** 2
             )
+            if distance < MIN_GRASP_DISTANCE:
+                self.node.get_logger().info(
+                    f'{bbox.name} はロボットから {distance:.3f} m と'
+                    f'近すぎるので無視します '
+                    f'(下限 {MIN_GRASP_DISTANCE:.3f} m)。'
+                )
+                continue
+
             self.node.get_logger().info(
                 f'把持候補 {bbox.name}: ロボットから {distance:.3f} m'
             )
