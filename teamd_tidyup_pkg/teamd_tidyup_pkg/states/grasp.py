@@ -34,6 +34,8 @@ GRIPPER_CLOSE_ANGLE = -0.1
 # キーは小文字で書いてください。
 GRIPPER_CLOSE_ANGLES = {
     'cleanser bottle': -0.3,
+    'clamp': -0.2,
+    'tomato can': -0.2,
 }
 # 握った後、走行姿勢へ移る前に真上へ引き上げる距離 [m]。
 # move_to_go は腕を大きく振るので、先に物体を持ち上げて逃がします。
