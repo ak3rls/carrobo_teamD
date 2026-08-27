@@ -1,80 +1,154 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""じゃんけんの YASMIN ステートマシンを構築するファイル.
+"""じゃんけんを実行する YASMIN ステートマシン."""
 
-ROS 通信を担当する ``JankenCoordinatorNode`` と、各ステートをつなぐ
-処理を分離しています。ここを読むとゲームの全体の流れが分かります。
-"""
 import rclpy
 from navigation_tools.navlib import NavModule
 from rclpy.node import Node
-from tf2_ros import Buffer
-from tf2_ros import TransformListener
 from yasmin import Blackboard
 from yasmin import StateMachine
 from yasmin_viewer import YasminViewerPub
 
-from yasmin import Blackboard, StateMachine
+from .states.continue_game import ContinueState
+from .states.human_hand import RecognizeHumanHandState
+from .states.janken import JankenState
+from .states.listener import WhisperState
+from .states.move_backward import (
+    MovebackwardState as MoveBackwardState,
+)
+from .states.move_forward import MoveForwardState
+from .states.robot_hand import ShowRobotHandState
 
-from .config import START_ALIASES, THROW_ALIASES
-from .states import linear, move_backward, move_forward, janken
-from .nodes import hand_recog, jyanken_robot_node
 
+class JankenStateMachineNode(Node):
+    """じゃんけんステートマシンを構築して実行するノード."""
 
-class JankenStateMachine(Node):
-    """じゃんけん 1 回分の状態遷移と blackboard を保持する."""
+    def __init__(self):
+        super().__init__('teamd_janken')
 
-    def __init__(self, node):
-        super().__init__()
-        self.node = node
+        self.nav = NavModule()
+
         self.blackboard = Blackboard()
-        # 各ステートが参照する値を初期化します。
-        self.blackboard.robot_choice = None
-        self.blackboard.player_choice = None
+        self.blackboard.human_hand = None
+        self.blackboard.robot_hand = None
+        self.blackboard.janken_result = None
 
-        sm = StateMachine(outcomes=["EXIT"])
-        sm.add_state(
-            name = "LISTENER",
-            state = linear.Whisper_state(self),
-            transitions = {
-                "success": "JANKEN"
-            }
+        self.state_machine = StateMachine(
+            outcomes=['SUCCEEDED', 'FAILED']
         )
-        sm.add_state(
-            name = "JANKEN",
-            state = 
-            
+
+        self.state_machine.add_state(
+            name='Whisper',
+            state=WhisperState(self),
+            transitions={
+                'success': 'RecognizeHumanHand', # 'succeeded'? 'success'?
+                'failed': 'FAILED',
+            },
         )
-        sm.add_state(
-            'EnableMediaPipe', DetectorControlState(node, True),
-            {'succeeded': 'WaitThrow', 'failed': 'FAILED'},
+
+        self.state_machine.add_state(
+            name='RecognizeHumanHand',
+            state=RecognizeHumanHandState(self, self.hand_recognizer),
+            transitions={
+                'succeeded': 'ShowRobotHand',
+                'failed': 'RecognizeHumanHand',
+            },
         )
-        sm.add_state(
-            'WaitThrow',
-            WaitWhisperState(node, THROW_ALIASES, 'waiting_throw_phrase'),
-            {'succeeded': 'ShowRobotChoice', 'failed': 'FAILED'},
+
+        self.state_machine.add_state(
+            name='ShowRobotHand',
+            state=ShowRobotHandState(self),
+            transitions={
+                'succeeded': 'Janken',
+                'failed': 'ShowRobotHand',
+            },
         )
-        sm.add_state(
-            'ShowRobotChoice', ShowRobotChoiceState(node),
-            {'succeeded': 'WaitPlayerGesture', 'failed': 'FAILED'},
+
+        self.state_machine.add_state(
+            name='Janken',
+            state=JankenState(self),
+            transitions={
+                'win': 'MoveForward',
+                'lose': 'MoveBackward',
+                'draw': 'RecognizeHumanHand',###
+                'failed': 'RecognizeHumanHand',
+            },
         )
-        sm.add_state(
-            'WaitPlayerGesture',
-            WaitPlayerGestureState(node, node.args.gesture_timeout),
-            {'succeeded': 'Judge', 'failed': 'FAILED'},
+
+        self.state_machine.add_state(
+            name='MoveForward',
+            state=MoveForwardState(self, self.nav),
+            transitions={
+                'succeeded': 'Continue',
+                'failed': 'Continue',
+            },
         )
-        sm.add_state(
-            'Judge', JudgeState(node),
-            {'succeeded': 'Finish', 'failed': 'FAILED'},
+
+        self.state_machine.add_state(
+            name='MoveBackward',
+            state=MoveBackwardState(self, self.nav),
+            transitions={
+                'succeeded': 'Continue',
+                'failed': 'Continue',
+            },
         )
-        sm.add_state(
-            'Finish', FinishState(node),
-            {'succeeded': 'SUCCEEDED', 'failed': 'FAILED'},
+
+        self.state_machine.add_state(
+            name='Continue',
+            state=ContinueState(self),
+            transitions={
+                'yes': 'Whisper',
+                'no': 'SUCCEEDED',
+                'failed': 'FAILED',
+            },
+        )
+
+        # 最初に実行するステート
+        self.state_machine.set_start_state('Whisper')
+
+        self.viewer = YasminViewerPub(
+            fsm_name='TEAMD_JANKEN',
+            fsm=self.state_machine,
+            node=self,
         )
 
     def run(self) -> str:
-        """YASMIN を実行し、``SUCCEEDED`` または ``FAILED`` を返す."""
-
-        outcome = self.fsm(blackboard=self.blackboard)
-        self.node.get_logger().info('Janken state machine finished: %s' % outcome)
+        """ステートマシンを実行する."""
+        outcome = self.state_machine(
+            blackboard=self.blackboard
+        )
+        self.get_logger().info(
+            f'Janken state machine finished: {outcome}'
+        )
         return outcome
+
+    def cleanup(self) -> None:
+        """使用したバックグラウンド処理を終了する."""
+        self.viewer.shutdown()
+        self.nav.shutdown()
+
+
+def main(args=None):
+    """ROS 2を初期化してステートマシンを実行する."""
+    rclpy.init(args=args)
+    node = None
+
+    try:
+        node = JankenStateMachineNode()
+        node.run()
+    except KeyboardInterrupt:
+        if node is not None:
+            node.get_logger().info(
+                'じゃんけんを中断します。'
+            )
+    finally:
+        if node is not None:
+            node.cleanup()
+            node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

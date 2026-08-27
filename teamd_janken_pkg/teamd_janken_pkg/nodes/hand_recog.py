@@ -45,7 +45,7 @@ class HandRecogNode(Node):
         self.srv = self.create_service(
             hand_recog,
             "hand_recog_jg",
-            self.
+            self.hand_recog_server
         )
 
         self.declare_parameter('camera_index', 0)
@@ -87,8 +87,11 @@ class HandRecogNode(Node):
                 '画像ウィンドウで q を押すと終了します。'
             )
     def hand_recog_server(self, request ,response):
-        response = self.hand_sign
-        return response
+        if self.hand_sign == None:
+            response = self.hand_sign
+            return response
+            
+        
 
     def process_frame(self) -> bool:
         """画像を1フレーム処理し、処理を継続するか返す."""
