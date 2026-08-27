@@ -41,11 +41,17 @@ BACKUP_TIMEOUT = 15.0
 
 
 def _hand_yaw(orientation) -> float:
-    """手のひらが真下のときの、指が閉じる方向の向き [rad] を返す.
+    """手のひらが真下のときの、指の間を通り抜ける向き [rad] を返す.
 
     hand_palm_link のローカル Y 軸が、左右の指が並ぶ向き
-    (＝グリッパが閉じる方向) です。これを base_link の水平面へ見た角度が、
-    物体のどの辺を挟むかを決めます。
+    (＝グリッパが閉じる方向) です。返すのはその向きそのものではなく、
+    そこから 90 度回した「指の間を通り抜ける辺の向き」です。
+    手のひらが真下の姿勢は必ず rpy(pi, 0, yaw) の形になり、この関数は
+    その yaw を返します。指が閉じるのは yaw - 90 度の向きです。
+
+    目標にしたい閉じ方向と直接比べるには、閉じ方向に 90 度足した向きを
+    渡します。長辺方向に閉じたい場合は、物体の長辺の向き + 90 度を
+    target_hand_yaw に設定します。これで指は短辺側の面に接触します。
     """
     rotation = tft.quaternion_matrix([
         orientation.x,
@@ -72,7 +78,7 @@ def _wrist_roll_goal(
     target_hand_yaw: float,
     limits,
 ) -> float:
-    """短辺を挟むための wrist_roll_joint の目標角を求める.
+    """長辺方向に閉じて短辺側の面を挟むための目標角を求める.
 
     hand_palm_link は wrist_roll_link に rpy(0,0,pi) で付いているだけなので、
     ハンドの Z 軸は wrist_roll の回転軸そのものです。手のひらが真下を向く
@@ -81,8 +87,9 @@ def _wrist_roll_goal(
 
     Args:
         current_roll: いまの wrist_roll_joint の角度 [rad]。
-        current_hand_yaw: いまの指の並びの向き [rad]。
-        target_hand_yaw: 合わせたい指の並びの向き [rad]。
+        current_hand_yaw: いまの指の間を通り抜ける向き [rad]。
+        target_hand_yaw: 合わせたい指の間を通り抜ける向き [rad]。
+            長辺方向に閉じる場合は、物体の長辺の向き + 90 度です。
         limits: (下限, 上限) [rad]。
 
     Returns:
@@ -132,8 +139,8 @@ class GraspState(State):
             )
             return WRIST_ROLL_LIMITS
 
-    def _rotate_wrist_to_short_edge(self, target_hand_yaw: float) -> None:
-        """手のひらを真下に向けたまま、短辺を挟む向きへ手首を回す."""
+    def _rotate_wrist_to_long_edge(self, target_hand_yaw: float) -> None:
+        """手のひらを真下に向けたまま、長辺方向に閉じる向きへ回す."""
         # 指令値ではなく実際の手先姿勢から測ります。IK が姿勢を厳密に
         # 出せていなくても、そのぶんを含めて合わせられます。
         _, orientation = self.hsrif.whole_body.get_end_effector_pose(
@@ -150,7 +157,7 @@ class GraspState(State):
             self._wrist_roll_limits(),
         )
         self.node.get_logger().info(
-            f'短辺を挟む向き={math.degrees(target_hand_yaw):.1f} deg, '
+            f'長辺方向に閉じる向き={math.degrees(target_hand_yaw):.1f} deg, '
             f'いまの指の向き={math.degrees(current_hand_yaw):.1f} deg -> '
             f'{WRIST_ROLL_JOINT}: {math.degrees(current_roll):.1f} deg -> '
             f'{math.degrees(goal):.1f} deg'
@@ -165,7 +172,7 @@ class GraspState(State):
         error = _fold_to_half_pi(_hand_yaw(moved) - target_hand_yaw)
         self.node.get_logger().info(
             f'回転後の指の向き={math.degrees(_hand_yaw(moved)):.1f} deg '
-            f'(短辺とのずれ={math.degrees(error):.1f} deg)'
+            f'(目標向きとのずれ={math.degrees(error):.1f} deg)'
         )
 
     def _lift(self, distance: float) -> None:
@@ -289,8 +296,8 @@ class GraspState(State):
             )
 
             if target_hand_yaw is not None:
-                self._step('短辺を挟む向きへ手首を回す')
-                self._rotate_wrist_to_short_edge(target_hand_yaw)
+                self._step('長辺方向に閉じる向きへ手首を回す')
+                self._rotate_wrist_to_long_edge(target_hand_yaw)
 
             # 手首を回しても手のひらの向き (ローカル +Z) は真下のままです。
             self._step(f'{blackboard.grasp_approach:.3f} m 手を伸ばす')

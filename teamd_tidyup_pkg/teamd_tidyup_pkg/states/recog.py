@@ -43,10 +43,9 @@ TARGET_NAME = ''
 EXCLUDED_NAMES = {
     'rubiks',
     '9-peg',
-    'lego',
 }
 
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.6
 MAX_GRASP_DISTANCE = 2.0
 DEPTH_SCALES = {
     '16UC1': 0.001,
@@ -68,7 +67,7 @@ SIDE_GRASP_APPROACH_DISTANCE = 0.15
 MIN_PREGRASP_RADIUS = 0.40
 # 把持位置の床からの高さ [m] の下限です。base_link の z=0 が床面なので、
 # 推定値をそのまま使うと平たい物体でグリッパが床に食い込みます。
-MIN_GRASP_HEIGHT = 0.022
+MIN_GRASP_HEIGHT = 0.021
 # wrist_roll_joint の可動域 [rad] (hsrb_description の URDF より)。
 # whole_body.joint_limits が引けなかったときのフォールバックです。
 WRIST_ROLL_LIMITS = (-1.92, 3.67)
@@ -130,7 +129,7 @@ def _horizontal_long_axis(box_orientation: Quaternion):
     """物体の水平な長辺方向の単位ベクトルを返す.
 
     把持点推定サービスは、箱のローカル X 軸を長辺、Y 軸を短辺と定めています。
-    上把持では、この向きに手首を合わせて短辺を挟みます。
+    上把持では、この向きをグリッパの閉じ方向に合わせて短辺側の面を挟みます。
     """
     box_quaternion = np.array(
         [
@@ -151,12 +150,32 @@ def _horizontal_long_axis(box_orientation: Quaternion):
     return long_axis / norm
 
 
-def _front_grasp_orientation(object_xy):
-    """ロボットから物体へまっすぐ手を伸ばす横把持の姿勢を作る.
+def _horizontal_short_axis(box_orientation: Quaternion):
+    """物体の水平な短辺方向の単位ベクトルを返す."""
+    box_quaternion = np.array(
+        [
+            box_orientation.x,
+            box_orientation.y,
+            box_orientation.z,
+            box_orientation.w,
+        ],
+        dtype=np.float64,
+    )
+    box_quaternion /= np.linalg.norm(box_quaternion)
 
-    物体の長辺方向から近づこうとすると、その向きによっては台車が大きく
-    回り込む必要が出ます。背の高い物体は正面から挟めれば十分なので、
-    接近方向をロボットから物体へ向かう水平方向に固定します。
+    short_axis = tft.quaternion_matrix(box_quaternion)[:3, 1].copy()
+    short_axis[2] = 0.0
+    norm = np.linalg.norm(short_axis)
+    if norm < np.finfo(np.float64).eps:
+        raise ValueError('物体の水平短辺方向を計算できません。')
+    return short_axis / norm
+
+
+def _side_grasp_orientation(approach_xy):
+    """指定した水平軸方向から接近する横把持の姿勢を作る.
+
+    背の高い物体では短辺方向から接近し、グリッパの閉じ方向を長辺方向に
+    合わせます。これにより、グリッパの指が物体の短辺側の面に接触します。
 
     できあがる手先姿勢は rpy(pi, -pi/2, yaw) で、
     ローカル +Z (接近方向) が物体の方向、
@@ -164,13 +183,13 @@ def _front_grasp_orientation(object_xy):
     ローカル X が鉛直上向きになります。
 
     Args:
-        object_xy: base_link 基準の物体の水平位置 (x, y)。
+        approach_xy: base_link 基準での接近方向の水平成分 (x, y)。
 
     Returns:
         (手先姿勢, 接近方向の単位ベクトル)。
     """
     direction = np.array(
-        [float(object_xy[0]), float(object_xy[1]), 0.0],
+        [float(approach_xy[0]), float(approach_xy[1]), 0.0],
         dtype=np.float64,
     )
     norm = np.linalg.norm(direction)
@@ -1151,7 +1170,7 @@ class RecogState(State):
             )
             return 'failed'
 
-        # 高さで上／横把持を選び、水平の短辺をグリッパで挟みます。
+        # 高さで上／横把持を選び、短辺側の面をグリッパで挟みます。
         height = grasp_response.grasp.size.z
         long_edge = grasp_response.grasp.size.x
         short_edge = grasp_response.grasp.size.y
@@ -1179,9 +1198,16 @@ class RecogState(State):
             object_pose.position.z = MIN_GRASP_HEIGHT
 
         if height > TALL_THRESHOLD:
-            orientation, approach_axis = _front_grasp_orientation(
-                (object_pose.position.x, object_pose.position.y),
+            short_axis = _horizontal_short_axis(object_pose.orientation)
+            object_xy = np.array(
+                [object_pose.position.x, object_pose.position.y],
+                dtype=np.float64,
             )
+            # PCA の短辺軸には180度の曖昧さがあるため、ロボットから物体へ
+            # 向かう側を選び、短辺方向から物体へ接近できるようにします。
+            if np.dot(short_axis[:2], object_xy) < 0.0:
+                short_axis *= -1.0
+            orientation, approach_axis = _side_grasp_orientation(short_axis[:2])
             # 手のひらを把持点の手前どれだけで止めるかは保ったまま、
             # ロボットに近づきすぎない範囲でプリグラスプを下げます。
             clearance = (
@@ -1208,9 +1234,10 @@ class RecogState(State):
             wrist_roll = None
             approach_yaw = math.atan2(approach_axis[1], approach_axis[0])
             self.node.get_logger().info(
-                '背が高い物体なので、正面から手を伸ばす横把持にします。'
+                '背が高い物体なので、短辺方向から接近する横把持にします。'
                 f'接近方向={math.degrees(approach_yaw):.1f} deg '
-                f'(ロボットから物体へ向かう向き)、'
+                f'(物体の短辺方向、ロボットから物体へ向かう向き)、'
+                'グリッパは長辺方向に閉じて短辺側の面を挟みます。'
                 f'把持点の {standoff * 100.0:.0f} cm 手前 '
                 f'(base_link から {object_distance - standoff:.2f} m) '
                 f'から {approach * 100.0:.0f} cm 伸ばして'
@@ -1223,17 +1250,18 @@ class RecogState(State):
 
             # 手のひらを真下に向ける姿勢だけを IK に渡します。
             # yaw を姿勢に含めると arm_roll など別の関節へ逃げることがあるので、
-            # 短辺に合わせる回転は wrist_roll_joint へ明示的に指令します。
-            # hand_palm_link は wrist_roll_link に rpy(pi,0,0) で付いているため、
-            # 手のひらが真下のとき wrist_roll の回転軸は base_link の +Z と一致し、
-            # wrist_roll を +d 回すとハンドが鉛直まわりに +d 回ります。
+            # 長辺に合わせる回転は wrist_roll_joint へ明示的に指令します。
+            # ここで渡す wrist_roll は「グリッパが閉じる方向に直交する向き」、
+            # つまり指の間を通り抜ける向きです。長辺に90度足した向きを渡すと、
+            # グリッパの閉じ方向が長辺と一致し、短辺側の面を挟めます。実際の
+            # 関節角への変換と符号は GraspState._rotate_wrist_to_long_edge が持ちます。
             qx, qy, qz, qw = tft.quaternion_from_euler(math.pi, 0.0, 0.0)
             orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
-            wrist_roll = math.atan2(long_axis[1], long_axis[0])
+            wrist_roll = math.atan2(long_axis[1], long_axis[0]) + math.pi / 2.0
             self.node.get_logger().info(
-                '平たい物体なので、短辺を挟む上把持にします。'
-                f'wrist_roll_joint を {math.degrees(wrist_roll):.1f} deg '
-                '回して短辺に合わせます。'
+                '平たい物体なので、長辺方向にグリッパを閉じる上把持にします。'
+                f'指の間を通す向き={math.degrees(wrist_roll):.1f} deg '
+                'に合わせ、短辺側の面を挟みます。'
             )
 
         object_pose.orientation = orientation
