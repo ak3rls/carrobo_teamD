@@ -36,10 +36,14 @@ DRAWER_PARAMETER_DEFAULTS = {
     # 実物は 36-45 px。12-22 px の誤検出を除く。
     'knob_min_box_pixels': 25.0,
     'knob_max_box_pixels': 120.0,
-    # つまみ検出時の首角度。YOLOEはこの角度で1回だけ実行する。
+    # つまみ検出時の首角度。YOLOEはこの角度だけで実行する。
     'knob_search_tilts': [-0.35],
     # 最初の検出だけ、より下向きにする。
     'first_detection_tilt': -0.55,
+    # 同じ首角度で複数フレームを取得し、外れ値を中央値で抑える。
+    'knob_detection_samples': 3,
+    'knob_min_detection_votes': 2,
+    'knob_detection_sample_interval': 0.20,
     'knob_max_distance': 2.0,
     'knob_min_height': 0.10,
     'knob_max_height': 0.95,
@@ -49,6 +53,9 @@ DRAWER_PARAMETER_DEFAULTS = {
     'detection_settle_seconds': 1.5,
     # 同一つまみとみなす距離（検出結果の整理用）。
     'same_knob_radius': 0.12,
+    # 把持前の再検出で、最初に選んだつまみと照合するための最大距離。
+    'final_alignment_match_radius': 0.10,
+    'final_alignment_detection': True,
     'knob_level_split': 0.40,
     # 一番奥のつまみより手前にある、開いた引き出しを除く。
     'opened_protrusion': 0.08,
@@ -367,7 +374,7 @@ class DrawerOpenTask:
         return knobs
 
     def _detect_knobs(self, first_detection: bool = False):
-        """首を設定してYOLOEを1回だけ実行し、odom上で結果を整理する。"""
+        """首を固定して複数回検出し、中央値でodom上の候補を整理する。"""
         radius = self._float('same_knob_radius')
         clusters = []
         if first_detection:
@@ -379,36 +386,50 @@ class DrawerOpenTask:
             configured_tilts = list(self._value('knob_search_tilts'))
             if not configured_tilts:
                 raise RuntimeError('knob_search_tilts が空です。')
-            # 複数角度の再検出は行わず、先頭の角度で1回だけ検出する。
+            # 複数角度の探索は行わず、先頭の角度でだけ検出する。
             search_tilts = [configured_tilts[0]]
         for tilt in search_tilts:
             self._look(float(tilt))
-            try:
-                knobs = self._detect_once()
-            except Exception as error:
-                self.logger.warn(f'tilt={float(tilt):.2f} の検出に失敗: {error}')
-                continue
-            for knob in knobs:
-                anchored = self._to_odom(knob)
-                for cluster in clusters:
-                    if math.dist(cluster[0].odom, anchored.odom) < radius:
-                        cluster.append(anchored)
-                        break
-                else:
-                    clusters.append([anchored])
+            samples = max(1, int(self._value('knob_detection_samples')))
+            for sample_index in range(samples):
+                try:
+                    knobs = self._detect_once()
+                except Exception as error:
+                    self.logger.warn(
+                        f'tilt={float(tilt):.2f} の検出 '
+                        f'({sample_index + 1}/{samples}) に失敗: {error}'
+                    )
+                    continue
+                for knob in knobs:
+                    anchored = self._to_odom(knob)
+                    for cluster in clusters:
+                        if math.dist(cluster[0].odom, anchored.odom) < radius:
+                            cluster.append(anchored)
+                            break
+                    else:
+                        clusters.append([anchored])
+                if sample_index + 1 < samples:
+                    self._spin(self._float('knob_detection_sample_interval'))
 
         base_x, base_y, yaw = self._base_pose()
         fused = []
+        min_votes = max(1, int(self._value('knob_min_detection_votes')))
         for cluster in clusters:
-            weights = np.array([max(knob.score, 1e-3) for knob in cluster])
-            mean = np.average(
-                [knob.odom for knob in cluster], axis=0, weights=weights
-            )
+            if len(cluster) < min_votes:
+                self.logger.info(
+                    f'つまみ候補を除外します: {len(cluster)} フレームだけで検出 '
+                    f'(必要 {min_votes} フレーム)'
+                )
+                continue
+            # YOLO のマスクが棚の縁まで広がると、score にかかわらず大きな
+            # 位置外れ値になる。各軸の中央値なら、その1フレームに把持姿勢を
+            # 引っ張られず、手前からの再検出でも安定する。
+            centre = np.median([knob.odom for knob in cluster], axis=0)
             # まとめた odom 上の点を、現在の台車座標系に戻す。
-            dx, dy = mean[0] - base_x, mean[1] - base_y
+            dx, dy = centre[0] - base_x, centre[1] - base_y
             x, y = self._rotate(dx, dy, -yaw)
-            knob = Knob(x, y, mean[2], weights.max())
-            knob.odom = (mean[0], mean[1], mean[2])
+            knob = Knob(x, y, centre[2], max(item.score for item in cluster))
+            knob.odom = tuple(centre)
             fused.append(knob)
         self.logger.info(f'つまみ {len(fused)} 個を検出 -> {fused}')
         return fused
@@ -544,6 +565,35 @@ class DrawerOpenTask:
             if error <= self._float('arm_settle_tolerance'):
                 return
 
+    def _refine_knob_for_grasp(self, original: Knob) -> Knob:
+        """把持直前に同じつまみだけを再検出し、位置を更新する。"""
+        if not bool(self._value('final_alignment_detection')):
+            return original
+        try:
+            candidates = self._detect_knobs()
+        except Exception as error:
+            self.logger.warn(f'把持前の再検出に失敗したため初回座標を使います: {error}')
+            return original
+        if not candidates:
+            self.logger.warn('把持前の再検出で候補が無いため初回座標を使います。')
+            return original
+        refined = min(
+            candidates, key=lambda candidate: math.dist(
+                candidate.odom, original.odom
+            )
+        )
+        delta = math.dist(refined.odom, original.odom)
+        if delta > self._float('final_alignment_match_radius'):
+            self.logger.warn(
+                f'把持前の候補が初回位置から {delta:.3f} m 離れているため、'
+                '別のつまみとみなして初回座標を使います。'
+            )
+            return original
+        self.logger.info(
+            f'把持前の再検出でつまみを更新します: {delta:.3f} m 補正'
+        )
+        return refined
+
     def _grasp(self, knob: Knob) -> bool:
         """少し後退して腕を伸ばし、前進して検出したつまみを掴む。"""
         bias = self._float('knob_depth_bias')
@@ -559,12 +609,19 @@ class DrawerOpenTask:
             grasp_left,
             '把持前に後退して上側の縁を回避',
         )
+
+        # 台車を近づけると、初回検出の視差・深度誤差がそのまま把持誤差に
+        # なる。ここで同じつまみだけを照合して、最後の base 移動量を更新する。
+        knob = self._refine_knob_for_grasp(knob)
+        knob_x, knob_y, _ = self._in_current_base(knob)
+        grasp_forward = knob_x + bias - self._float('grasp_reach_x')
+        grasp_left = knob_y - self._float('grasp_offset_y')
         self._set_arm(knob)
 
         # 腕を伸ばした姿勢を保ったまま、検出したつまみの位置まで
         # 台車を前進させて把持する。
         self._drive_base(
-            backoff, 0.0,
+            grasp_forward, grasp_left,
             '腕を伸ばしたまま前進して把持位置へ',
         )
         self._log_residual(knob)
