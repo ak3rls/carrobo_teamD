@@ -26,6 +26,15 @@ WRIST_ROLL_LIMITS = (-1.92, 3.67)
 SETTLE_TIME = 0.5
 # グリッパを閉じるのにかける時間 [s]。短いと薄い物体を弾いてしまいます。
 GRIPPER_CLOSE_TIME = 2.0
+# グリッパを閉じるときの目標角 [rad]。負の値ほど強く握り込みます。
+GRIPPER_CLOSE_ANGLE = -0.1
+# 物体ごとに握り込み量を変えたいときに指定します。
+# 太くて滑る物体は強く握らないと持ち上げられません。
+# ここに無い物体は GRIPPER_CLOSE_ANGLE を使います。
+# キーは小文字で書いてください。
+GRIPPER_CLOSE_ANGLES = {
+    'cleanser bottle': -0.3,
+}
 # 握った後、走行姿勢へ移る前に真上へ引き上げる距離 [m]。
 # move_to_go は腕を大きく振るので、先に物体を持ち上げて逃がします。
 LIFT_DISTANCE = 0.05
@@ -308,9 +317,13 @@ class GraspState(State):
             )
 
             # 降下の揺れが止まってから閉じます。
-            self._step('グリッパを閉じる')
+            close_angle = GRIPPER_CLOSE_ANGLES.get(
+                blackboard.target_name.lower(),
+                GRIPPER_CLOSE_ANGLE,
+            )
+            self._step(f'グリッパを閉じる (目標 {close_angle:.2f} rad)')
             self.hsrif.gripper.command(
-                -0.1,
+                close_angle,
                 GRIPPER_CLOSE_TIME,
                 sync=True,
             )

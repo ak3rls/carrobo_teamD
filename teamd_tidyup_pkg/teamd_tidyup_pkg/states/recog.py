@@ -43,6 +43,8 @@ TARGET_NAME = ''
 EXCLUDED_NAMES = {
     'rubiks',
     '9-peg',
+    'pitcher base',
+    'plate',
 }
 
 CONFIDENCE_THRESHOLD = 0.6
@@ -70,7 +72,36 @@ SIDE_GRASP_APPROACH_DISTANCE = 0.15
 MIN_PREGRASP_RADIUS = 0.40
 # 把持位置の床からの高さ [m] の下限です。base_link の z=0 が床面なので、
 # 推定値をそのまま使うと平たい物体でグリッパが床に食い込みます。
-MIN_GRASP_HEIGHT = 0.021
+MIN_GRASP_HEIGHT = 0.0215
+# 長辺方向に沿って把持位置を測り直す物体と、中点からさらに細い側へ
+# 寄せる量 [m] です。キーは小文字で書いてください。
+#
+# 把持点推定サービスが返す位置は有効深度点の重心です。スプーンのように
+# 片側 (受け皿) の面積が大きい物体では重心がそちらへ引っ張られ、端を
+# 掴んで落とします。長辺方向の広がりの中点なら形が偏っていても物体の
+# 真ん中になるので、そこを基準にして細い側 (柄) へ寄せます。
+#
+# ここに無い物体は、サービスが返す重心をそのまま使います。
+# 左右対称な物体 (Bowl など) では細い側を判定できないので、その場合は
+# ロボット側の縁へ寄せます。負の値にすると奥側の縁へ寄ります。
+GRASP_LONG_AXIS_OFFSETS = {
+    'spoon': 0.040,
+    'bowl': 0.030,
+}
+# 上把持で、手首を回すときの高さを物体ごとに追加で上げる量 [m] です。
+# お椀のように縁が高い物体は、把持点の 10 cm 上でも手首を回すと縁に
+# 当たります。ここで上げた分は降りる距離にも足すので、最終的に掴む
+# 位置は変わりません。ここに無い物体は既定の 10 cm のままです。
+# キーは小文字で書いてください。
+WRIST_ROTATION_EXTRA_LIFT = {
+    'bowl': 0.050,
+}
+# 長辺方向の広がりを測るときに、両端で無視する割合 [%]。
+# マスクのはみ出しで端が伸びても中点がずれないようにします。
+LONG_AXIS_TRIM_PERCENT = 2.0
+# 長辺の前後で短辺方向の幅がこれ以下しか違わなければ、左右対称とみなして
+# 細い側の判定を諦めます [m]。ノイズで向きが毎回反転するのを防ぎます。
+SYMMETRIC_WIDTH_MARGIN = 0.010
 # wrist_roll_joint の可動域 [rad] (hsrb_description の URDF より)。
 # whole_body.joint_limits が引けなかったときのフォールバックです。
 WRIST_ROLL_LIMITS = (-1.92, 3.67)
@@ -853,6 +884,189 @@ class RecogState(State):
         lowered = name.lower()
         return lowered in EXCLUDED_NAMES or lowered in self.attempted_names
 
+    def _long_axis_center(self, detections, index, grasp, extra_shift):
+        """把持位置を、物体の長辺方向の中点から細い側へ寄せた点にする.
+
+        サービスが返す位置は有効深度点の重心です。スプーンのように片側だけ
+        面積が大きい物体では、重心が広いほう (受け皿側) へ寄ってしまい、
+        端を掴んで落とします。長辺方向の広がりの中点なら、形が偏っていても
+        物体の真ん中になります。そこからさらに細い側へ寄せて、細い柄を
+        挟めるようにします。
+
+        Args:
+            detections: 検出結果 (深度・マスク・camera_info を持つ)。
+            index: 対象物体の添字。
+            grasp: 把持点推定サービスの結果 (カメラ座標系)。
+            extra_shift: 中点から細い側へ寄せる距離 [m]。
+
+        Returns:
+            カメラ座標系の位置 (x, y, z)。計算できなければ None。
+        """
+        depth_scale = DEPTH_SCALES.get(detections.depth.encoding)
+        if depth_scale is None:
+            return None
+
+        try:
+            depth = self.bridge.imgmsg_to_cv2(
+                detections.depth,
+                desired_encoding=detections.depth.encoding,
+            ).astype(np.float64) * depth_scale
+            mask = self.bridge.imgmsg_to_cv2(
+                detections.segments[index],
+                desired_encoding='mono8',
+            )
+        except Exception as error:  # cv_bridge の例外型は環境で異なる
+            self.node.get_logger().warning(
+                f'長辺中点の計算用に画像を変換できませんでした: {error}'
+            )
+            return None
+
+        if depth.shape[:2] != mask.shape[:2]:
+            return None
+
+        k = detections.camera_info.k
+        fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+        if fx == 0.0 or fy == 0.0:
+            return None
+
+        valid = (
+            (mask != 0)
+            & np.isfinite(depth)
+            & (depth > 0.0)
+            & (depth <= MAX_GRASP_DISTANCE)
+        )
+        ys, xs = np.nonzero(valid)
+        if ys.size < 10:
+            return None
+
+        distances = depth[ys, xs]
+        # サービスと同じ基準で、マスクの縁が拾った背景を落とします。
+        median = float(np.median(distances))
+        mad = float(np.median(np.abs(distances - median))) * 1.4826
+        inliers = np.abs(distances - median) <= max(3.0 * mad, 0.005)
+        if np.count_nonzero(inliers) < 10:
+            return None
+        distances = distances[inliers]
+        xs = xs[inliers]
+        ys = ys[inliers]
+
+        points = np.stack(
+            [
+                (xs - cx) * distances / fx,
+                (ys - cy) * distances / fy,
+                distances,
+            ],
+            axis=1,
+        )
+
+        box_quaternion = np.array(
+            [
+                grasp.pose.orientation.x,
+                grasp.pose.orientation.y,
+                grasp.pose.orientation.z,
+                grasp.pose.orientation.w,
+            ],
+            dtype=np.float64,
+        )
+        norm = np.linalg.norm(box_quaternion)
+        if norm < np.finfo(np.float64).eps:
+            return None
+        # 箱のローカル X が長辺、Y が短辺です (カメラ座標系のまま扱います)。
+        rotation = tft.quaternion_matrix(box_quaternion / norm)[:3, :3]
+        long_axis = rotation[:, 0]
+
+        centroid = np.array(
+            [
+                grasp.pose.position.x,
+                grasp.pose.position.y,
+                grasp.pose.position.z,
+            ],
+            dtype=np.float64,
+        )
+        projection = (points - centroid) @ long_axis
+        lower = float(np.percentile(projection, LONG_AXIS_TRIM_PERCENT))
+        upper = float(
+            np.percentile(projection, 100.0 - LONG_AXIS_TRIM_PERCENT)
+        )
+        midpoint = (lower + upper) * 0.5
+
+        shift = midpoint
+        if extra_shift != 0.0:
+            short_projection = (points - centroid) @ rotation[:, 1]
+            sign = self._thin_side_sign(
+                projection,
+                short_projection,
+                midpoint,
+            )
+            if sign == 0.0:
+                # 左右対称で細い側を決められない物体 (お椀など) では、
+                # 手前の縁へ寄せます。カメラ座標系の +Z が奥行きなので、
+                # 長辺軸の Z 成分と逆向きが手前になります。
+                sign = -math.copysign(1.0, long_axis[2])
+                self.node.get_logger().info(
+                    '細い側を決められないので、手前側の縁へ寄せます。'
+                )
+            shift += extra_shift * sign
+
+        self.node.get_logger().info(
+            f'長辺方向: 重心 +0 mm / 中点 {midpoint * 1000.0:+.0f} mm / '
+            f'掴む位置 {shift * 1000.0:+.0f} mm '
+            f'(広がり {upper - lower:.3f} m)。'
+        )
+        if not lower <= shift <= upper:
+            self.node.get_logger().warning(
+                f'掴む位置 {shift * 1000.0:+.0f} mm が物体の範囲 '
+                f'[{lower * 1000.0:+.0f}, {upper * 1000.0:+.0f}] mm を'
+                'はみ出しています。寄せる量が大きすぎます。'
+            )
+        return centroid + shift * long_axis
+
+    def _thin_side_sign(
+        self,
+        projection,
+        short_projection,
+        midpoint: float,
+    ) -> float:
+        """長辺の中点から見て、細いほうの端の符号を返す.
+
+        PCA の長辺軸は符号が任意なので、中点の前後それぞれで短辺方向の
+        広がりを測り、狭いほうを選びます。判定できないときは 0.0 です。
+        """
+        def spread(selected) -> float:
+            if np.count_nonzero(selected) < 10:
+                return float('inf')
+            values = short_projection[selected]
+            return float(
+                np.percentile(values, 100.0 - LONG_AXIS_TRIM_PERCENT)
+                - np.percentile(values, LONG_AXIS_TRIM_PERCENT)
+            )
+
+        positive = projection > midpoint
+        width_positive = spread(positive)
+        width_negative = spread(~positive)
+        if not np.isfinite(width_positive) and not np.isfinite(
+            width_negative
+        ):
+            self.node.get_logger().warning(
+                '長辺の細い側を判定できませんでした。中点を掴みます。'
+            )
+            return 0.0
+        # 差が小さいときは対称とみなして判定を諦めます。ノイズで
+        # 向きが毎回反転するのを防ぐためです。
+        narrow = min(width_positive, width_negative)
+        wide = max(width_positive, width_negative)
+        if not np.isfinite(wide) or wide - narrow < SYMMETRIC_WIDTH_MARGIN:
+            self.node.get_logger().info(
+                f'長辺の前後で幅の差が小さいです '
+                f'({narrow:.3f} m 対 {wide:.3f} m)。'
+            )
+            return 0.0
+
+        self.node.get_logger().info(
+            f'細い側の判定: 幅 {narrow:.3f} m 対 {wide:.3f} m。'
+        )
+        return 1.0 if width_positive < width_negative else -1.0
+
     def _select_target(self, detections) -> int:
         """対象名に一致する検出のうち、ロボットに最も近い添字を返す.
 
@@ -1173,6 +1387,26 @@ class RecogState(State):
         stamped = PoseStamped()
         stamped.header = detections.camera_info.header
         stamped.pose = grasp_response.grasp.pose
+
+        # 指定された物体は、重心ではなく長辺方向の中点を基準に掴みます。
+        target_name = detections.bbox[index].name
+        extra_shift = GRASP_LONG_AXIS_OFFSETS.get(target_name.lower())
+        if extra_shift is not None:
+            center = self._long_axis_center(
+                detections,
+                index,
+                grasp_response.grasp,
+                extra_shift,
+            )
+            if center is None:
+                self.node.get_logger().warning(
+                    f'{target_name} の長辺方向の中点を計算できなかったため、'
+                    '重心のまま掴みます。'
+                )
+            else:
+                stamped.pose.position.x = float(center[0])
+                stamped.pose.position.y = float(center[1])
+                stamped.pose.position.z = float(center[2])
         try:
             object_pose = self._transform_pose(stamped, 'base_link')
         except TransformException as error:
@@ -1207,6 +1441,7 @@ class RecogState(State):
                 f'{MIN_GRASP_HEIGHT:.3f} m まで持ち上げます。'
             )
             object_pose.position.z = MIN_GRASP_HEIGHT
+
 
         if height > TALL_THRESHOLD:
             short_axis = _horizontal_short_axis(object_pose.orientation)
@@ -1256,8 +1491,21 @@ class RecogState(State):
             )
         else:
             long_axis = _horizontal_long_axis(object_pose.orientation)
-            object_pose.position.z += 0.1
-            approach = 0.05
+            # 手首を回す高さを物体ごとに上げられるようにします。上げた分は
+            # 降りる距離にも足すので、掴む位置そのものは変わりません。
+            extra_lift = WRIST_ROTATION_EXTRA_LIFT.get(
+                target_name.lower(),
+                0.0,
+            )
+            object_pose.position.z += 0.1 + extra_lift
+            approach = 0.05 + extra_lift
+            if extra_lift != 0.0:
+                self.node.get_logger().info(
+                    f'{target_name} は手首を回す高さを '
+                    f'{extra_lift * 1000.0:.0f} mm 上げます '
+                    f'(把持点の {(0.1 + extra_lift) * 100.0:.0f} cm 上で回し、'
+                    f'{approach * 100.0:.0f} cm 降ります)。'
+                )
 
             # 手のひらを真下に向ける姿勢だけを IK に渡します。
             # yaw を姿勢に含めると arm_roll など別の関節へ逃げることがあるので、
