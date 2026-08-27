@@ -20,6 +20,21 @@ ros2 launch teamd_tidyup_pkg tidyup.launch.py
 Viewer と本ステートマシンを起動します。
 bring upとnavigation、Issac Simは立ち上げておいてください。
 
+## YOLOE版（tidy_sm2）
+
+YOLOv11版を残したまま、YOLOE segmentation と `models/objectlist.yaml` の44個の
+物体名を使う構成を `tidyup2.launch.py` に用意しています。YOLOE用の prompt 埋め込みは
+`objectlist_yoloe_embeddings.npz` を使うため、毎回テキスト埋め込みを生成せずに検出します。
+
+```bash
+ros2 launch teamd_tidyup_pkg tidyup2.launch.py
+```
+
+この構成では `yoloe_detection/service` と `tidy_sm2`（`Recog2`）を使用します。
+埋め込みは既定の `yoloe-11l-seg.pt` 用です。別の YOLOE 重みを試す場合は、
+そのモデル用に生成した prompt 埋め込みへ差し替えてから
+`model_path:=/path/to/yoloe-11l-seg.pt` を指定してください。
+
 ## YOLO未検出時のRex-Omni最終確認
 
 `Recog`はYOLOで3回連続して物体を検出できなかった場合、同じ視点の最新1フレームを

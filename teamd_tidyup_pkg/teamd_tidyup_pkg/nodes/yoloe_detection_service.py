@@ -3,51 +3,26 @@
 """YOLOE promptsを設定した物体検出サービス."""
 
 from importlib.resources import files
-from pathlib import Path
-
 import rclpy
-import yaml
-from ament_index_python.packages import get_package_share_directory
 from yolov8_detection.detection_service import YOLOv8Node
 
+from teamd_tidyup_pkg.objectlist import load_objectlist
 
-OBJECTLIST_FILE = 'objectlist.yaml'
 PROMPT_EMBEDDINGS = 'objectlist_yoloe_embeddings.npz'
 
 
 def _load_objectlist():
     """YAMLからプロンプト一覧と物体名からカテゴリへの対応を読み込む."""
-    objectlist_path = (
-        Path(get_package_share_directory('teamd_tidyup_pkg'))
-        / 'models'
-        / OBJECTLIST_FILE
-    )
-    with objectlist_path.open(encoding='utf-8') as stream:
-        data = yaml.safe_load(stream)
-
-    categories = data.get('categories') if isinstance(data, dict) else None
-    if not isinstance(categories, dict):
-        raise ValueError('objectlist.yamlにcategoriesがありません。')
-
-    prompts = []
-    category_by_name = {}
-    for category, names in categories.items():
-        if not isinstance(category, str) or not isinstance(names, list):
-            raise ValueError('objectlist.yamlのカテゴリ形式が不正です。')
-        for name in names:
-            if not isinstance(name, str) or name in category_by_name:
-                raise ValueError('objectlist.yamlの物体名が不正または重複しています。')
-            prompts.append(name)
-            category_by_name[name] = category
-
-    return prompts, category_by_name
+    return load_objectlist()
 
 
 def _objectlist_names(model_names, prompts):
     """同じ44クラスのモデル名をobjectlist表記へ対応付ける."""
     def key(name):
         normalized = name.lower().replace('nine', '9')
-        return ''.join(character for character in normalized if character.isalnum())
+        return ''.join(
+            character for character in normalized if character.isalnum()
+        )
 
     objectlist_by_key = {key(name): name for name in prompts}
     names = (

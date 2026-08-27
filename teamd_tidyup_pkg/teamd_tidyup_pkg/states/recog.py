@@ -32,6 +32,9 @@ from yolov8_detection_interfaces.srv import ObjectDetectionService
 from carrobo_manipulation_pkg.hsrif import HSRInterfaces
 
 
+DEFAULT_DETECTION_SERVICE = '/yolov8_detection/service'
+
+
 # 掴みたい物体名を指定します。
 # 既存の把持例と同じ対象を初期値にしています。
 # 空文字にするとロボットから最も近い物体を選びます。
@@ -72,7 +75,7 @@ SIDE_GRASP_APPROACH_DISTANCE = 0.15
 MIN_PREGRASP_RADIUS = 0.40
 # 把持位置の床からの高さ [m] の下限です。base_link の z=0 が床面なので、
 # 推定値をそのまま使うと平たい物体でグリッパが床に食い込みます。
-MIN_GRASP_HEIGHT = 0.0215
+MIN_GRASP_HEIGHT = 0.020
 # 長辺方向に沿って把持位置を測り直す物体と、中点からさらに細い側へ
 # 寄せる量 [m] です。キーは小文字で書いてください。
 #
@@ -86,6 +89,8 @@ MIN_GRASP_HEIGHT = 0.0215
 # ロボット側の縁へ寄せます。負の値にすると奥側の縁へ寄ります。
 GRASP_LONG_AXIS_OFFSETS = {
     'spoon': 0.040,
+    'fork': 0.040,
+    'spatula': 0.040,
     'bowl': 0.030,
 }
 # 上把持で、手首を回すときの高さを物体ごとに追加で上げる量 [m] です。
@@ -115,12 +120,19 @@ RECOG_GRIPPER_ANGLE = 0.0
 # 下の向き直しを使い切ってからこの回数を数えます。
 MAX_EMPTY_DETECTIONS = 1
 
-# YOLO が空振りしたとき、その場で体の向きを変えてもう一度試す部屋です。
-ROTATION_RETRY_ROOMS = {'roomA'}
+# 向きや位置を変える前に、同じ姿勢で床を見る回数です。
+# YOLO は取りこぼすことがあるので、動く前に複数回試します。
+FLOOR_DETECTIONS_BEFORE_MOVE = 2
+
+# YOLO が空振りしたとき、その場で体の向きを変えてもう一度床を見る
+# 部屋と、そのときの回頭量 [rad] です。正で左回り、負で右回りです。
+# ここに無い部屋では回頭しません。
+ROTATION_RETRY_YAWS = {
+    'roomA': math.radians(60.0),
+    'roomB': math.radians(-60.0),
+}
 # 1 つの部屋で向きを変えて試す回数です。
 MAX_ROTATION_RETRIES = 1
-# 1 回あたりの回頭量 [rad]。正で左回り、負で右回りです。
-ROTATION_RETRY_YAW = math.radians(60.0)
 
 # False にすると Rex-Omni を一切呼ばず、YOLO と下の正面向き再試行だけで
 # 探索します。モデルのロードを伴わないぶん速く終わります。
@@ -131,10 +143,18 @@ USE_REX_OMNI = False
 FORWARD_RETRY_ROOMS = {'roomA', 'roomB'}
 # そのときのヘッドの傾き [rad]。0.0 で正面です。全部屋で共通です。
 FORWARD_HEAD_TILT = 0.0
+# 部屋ごとに机を見るときの傾きを変えたいときに指定します [rad]。
+# 負の値で下を向きます。ここに無い部屋は FORWARD_HEAD_TILT を使います。
+FORWARD_HEAD_TILTS = {
+    'roomB': math.radians(-15.0),
+}
 # 机の上を見に行くときの立ち位置 (map 座標系) を部屋ごとに指定します。
 # 指定が無い部屋では移動せず、回した分だけ戻して 0 度で見ます。
 FORWARD_RETRY_POSES = {
-    'roomB': {'x': 6.9, 'y': 3.59, 'yaw': 0.0,
+    'roomB': {
+        'x': 6.9,
+        'y': 3.59,
+        'yaw': 0.0,
     },
 }
 
@@ -251,6 +271,7 @@ class RecogState(State):
         hsrif: HSRInterfaces,
         tf_buffer: Buffer,
         nav=None,
+        detect_service_name: str = DEFAULT_DETECTION_SERVICE,
     ):
         """サービスクライアントを生成する.
 
@@ -259,12 +280,14 @@ class RecogState(State):
             hsrif: ロボットのインターフェース。
             tf_buffer: カメラ座標系から base_link へ変換するための Buffer。
             nav: 観測位置へ移動するための NavModule。None なら移動しません。
+            detect_service_name: 物体検出サービス名。
         """
         super().__init__(outcomes=['succeeded', 'failed', 'none'])
         self.node = node
         self.hsrif = hsrif
         self.tf_buffer = tf_buffer
         self.nav = nav
+        self.detect_service_name = detect_service_name
         self.empty_detection_count = 0
         # 向き直しは部屋ごとに数え直すので、いまいる部屋を覚えておきます。
         self.current_room = None
@@ -273,6 +296,8 @@ class RecogState(State):
         # この部屋で既に把持対象にした物体名です (小文字)。
         # 把持に失敗しても同じ物体を掴み直さないよう、候補から外します。
         self.attempted_names = set()
+        # いまの姿勢で床を見た回数です。姿勢を変えるたびに数え直します。
+        self.floor_detection_count = 0
         # 直前の _select_target で TF 変換に失敗した候補があったかどうか。
         self.tf_error_in_selection = False
         # この部屋で次に使う観測位置の添字です。
@@ -289,7 +314,7 @@ class RecogState(State):
         self.bridge = CvBridgeUtils()
 
         self.detect_client = self.node.create_client(
-            ObjectDetectionService, '/yolov8_detection/service'
+            ObjectDetectionService, self.detect_service_name
         )
         self.rex_detect_client = self.node.create_client(
             RexObjectDetectionService,
@@ -555,6 +580,7 @@ class RecogState(State):
         if room != self.current_room:
             self.current_room = room
             self.empty_detection_count = 0
+            self.floor_detection_count = 0
             self.rotation_retry_count = 0
             self.forward_retry_done = False
             self.attempted_names = set()
@@ -570,21 +596,21 @@ class RecogState(State):
         変えて安い YOLO をもう一度試します。回頭できたら失敗として戻り、
         ステートマシンの自己ループで Recog をやり直します。
         """
-        if self.current_room not in ROTATION_RETRY_ROOMS:
+        yaw = ROTATION_RETRY_YAWS.get(self.current_room)
+        if yaw is None:
             return False
         if self.rotation_retry_count >= MAX_ROTATION_RETRIES:
             return False
 
         self.rotation_retry_count += 1
-        degrees = math.degrees(ROTATION_RETRY_YAW)
         self.node.get_logger().info(
             f'{self.current_room} で物体を検出できなかったため、'
-            f'{degrees:.0f} 度向きを変えてもう一度 YOLO を試します '
+            f'{math.degrees(yaw):.0f} 度向きを変えてもう一度床を見ます '
             f'({self.rotation_retry_count}/{MAX_ROTATION_RETRIES})。'
         )
-        if not self._rotate_base(ROTATION_RETRY_YAW):
+        if not self._rotate_base(yaw):
             return False
-        self.applied_rotation += ROTATION_RETRY_YAW
+        self.applied_rotation += yaw
         return True
 
     def _rotate_base(self, yaw: float) -> bool:
@@ -804,11 +830,16 @@ class RecogState(State):
         self.forward_retry_done = True
         self._move_to_forward_pose()
 
+        head_tilt = FORWARD_HEAD_TILTS.get(
+            self.current_room,
+            FORWARD_HEAD_TILT,
+        )
         self.node.get_logger().info(
-            f'{self.current_room} なので、首を正面に向けて '
+            f'{self.current_room} なので、首を '
+            f'{math.degrees(head_tilt):.0f} 度に向けて '
             'YOLO をもう一度だけ試します。'
         )
-        detections = self._look_and_detect(FORWARD_HEAD_TILT)
+        detections = self._look_and_detect(head_tilt)
         if detections is None:
             return None
 
@@ -1229,11 +1260,13 @@ class RecogState(State):
 
     def execute(self, blackboard: Blackboard) -> str:
         """対象物体を認識し、把持前姿勢を Blackboard に保存する."""
-        self.node.get_logger().info('Executing state Recog')
+        self.node.get_logger().info(
+            f'Executing state {self.__class__.__name__}'
+        )
         self._reset_for_room(blackboard)
 
         if not self._wait_for_service(
-            self.detect_client, '/yolov8_detection/service'
+            self.detect_client, self.detect_service_name
         ):
             return 'failed'
         if not self._wait_for_service(
@@ -1271,6 +1304,20 @@ class RecogState(State):
             index = self._select_target(detections)
 
         if index < 0:
+            # 姿勢を変える前に、同じ場所からもう一度床を見ます。
+            # 1 回の検出では取りこぼすことがあるためです。
+            self.floor_detection_count += 1
+            if self.floor_detection_count < FLOOR_DETECTIONS_BEFORE_MOVE:
+                self.node.get_logger().info(
+                    '同じ姿勢のまま、もう一度床を見ます '
+                    f'({self.floor_detection_count}/'
+                    f'{FLOOR_DETECTIONS_BEFORE_MOVE})。'
+                )
+                return 'failed'
+
+            # 見終わったので、次の姿勢では改めて数え直します。
+            self.floor_detection_count = 0
+
             # Rex-Omni へ移る前に、向きを変えて YOLO をもう一度試します。
             if self._rotate_and_retry():
                 return 'failed'
@@ -1355,6 +1402,7 @@ class RecogState(State):
         # _restore_rotation() で 60 度に戻したところからさらに 60 度
         # 回ってしまいます。1 つの部屋で回すのは 1 回だけです。
         self.empty_detection_count = 0
+        self.floor_detection_count = 0
         self.forward_retry_done = False
         if index >= len(detections.segments):
             self.node.get_logger().error(
@@ -1425,12 +1473,15 @@ class RecogState(State):
             object_pose.orientation.z,
             object_pose.orientation.w,
         ])[2]
+        aspect_ratio = (
+            long_edge / short_edge if short_edge > 0.0 else float('inf')
+        )
         self.node.get_logger().info(
             '推定した物体寸法: '
             f'長辺={long_edge:.3f} m, 短辺={short_edge:.3f} m, '
             f'高さ={height:.3f} m / '
             f'長辺方向(base_link)={math.degrees(box_yaw):.1f} deg / '
-            f'長短比={long_edge / short_edge if short_edge > 0.0 else float("inf"):.2f} / '
+            f'長短比={aspect_ratio:.2f} / '
             f'把持={"横" if height > TALL_THRESHOLD else "上"}'
         )
 
@@ -1442,7 +1493,6 @@ class RecogState(State):
             )
             object_pose.position.z = MIN_GRASP_HEIGHT
 
-
         if height > TALL_THRESHOLD:
             short_axis = _horizontal_short_axis(object_pose.orientation)
             object_xy = np.array(
@@ -1453,7 +1503,9 @@ class RecogState(State):
             # 向かう側を選び、短辺方向から物体へ接近できるようにします。
             if np.dot(short_axis[:2], object_xy) < 0.0:
                 short_axis *= -1.0
-            orientation, approach_axis = _side_grasp_orientation(short_axis[:2])
+            orientation, approach_axis = _side_grasp_orientation(
+                short_axis[:2]
+            )
             # 手のひらを把持点の手前どれだけで止めるかは保ったまま、
             # ロボットに近づきすぎない範囲でプリグラスプを下げます。
             clearance = (

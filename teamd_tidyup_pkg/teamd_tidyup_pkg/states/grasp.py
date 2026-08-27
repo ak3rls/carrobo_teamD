@@ -34,12 +34,13 @@ GRIPPER_CLOSE_ANGLE = -0.1
 # キーは小文字で書いてください。
 GRIPPER_CLOSE_ANGLES = {
     'cleanser bottle': -0.3,
-    'clamp': -0.2,
+    # 'clamp': -0.2,
     'tomato can': -0.2,
 }
 # 握った後、走行姿勢へ移る前に真上へ引き上げる距離 [m]。
-# move_to_go は腕を大きく振るので、先に物体を持ち上げて逃がします。
-LIFT_DISTANCE = 0.05
+# 台車を後退させる前に物体を床から離さないと、引きずってしまいます。
+# move_to_go も腕を大きく振るので、その前に逃がす意味もあります。
+LIFT_DISTANCE = 0.10
 
 # 上把持のとき、引き上げた後に台車を後退させる距離 [m]。
 # 手を真下に向けて掴むと机や棚のすぐ上に腕がいるので、離れてから
@@ -197,7 +198,7 @@ class GraspState(State):
         Args:
             distance: 引き上げる距離 [m]。
         """
-        _, orientation = self.hsrif.whole_body.get_end_effector_pose(
+        before, orientation = self.hsrif.whole_body.get_end_effector_pose(
             'base_link'
         )
         rotation = tft.quaternion_matrix([
@@ -210,13 +211,28 @@ class GraspState(State):
         axis = rotation.T @ np.array([0.0, 0.0, 1.0])
         self.node.get_logger().info(
             f'真上へ {distance:.3f} m 引き上げます '
-            f'(手先ローカル軸={np.round(axis, 2)})。'
+            f'(手先ローカル軸={np.round(axis, 2)}, '
+            f'いまの高さ z={before.z:.3f} m)。'
         )
         self.hsrif.whole_body.move_end_effector_by_line(
             (float(axis[0]), float(axis[1]), float(axis[2])),
             distance,
             sync=True,
         )
+
+        # 実際に上がったかを残します。台車を動かす前に床から離れて
+        # いなければ物体を引きずるので、ここで分かるようにします。
+        after, _ = self.hsrif.whole_body.get_end_effector_pose('base_link')
+        risen = after.z - before.z
+        self.node.get_logger().info(
+            f'引き上げ後の高さ z={after.z:.3f} m (実際に上がった量 '
+            f'{risen:.3f} m / 指令 {distance:.3f} m)。'
+        )
+        if risen < distance * 0.5:
+            self.node.get_logger().warning(
+                '指令したほど上がっていません。'
+                'このまま台車を動かすと物体を引きずります。'
+            )
 
     def _back_up(self, distance: float) -> None:
         """台車を、向きを変えずにまっすぐ後退させる.

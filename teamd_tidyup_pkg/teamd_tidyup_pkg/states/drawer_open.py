@@ -57,6 +57,9 @@ DRAWER_PARAMETER_DEFAULTS = {
     'final_alignment_match_radius': 0.10,
     'final_alignment_detection': True,
     'knob_level_split': 0.40,
+    # 右側優先のとき、一番右からこの幅以内のつまみは同じ列とみなす [m]。
+    # 同じ列の中では低い位置のつまみを先に開ける。
+    'knob_column_tolerance': 0.06,
     # 一番奥のつまみより手前にある、開いた引き出しを除く。
     'opened_protrusion': 0.08,
 
@@ -482,11 +485,20 @@ class DrawerOpenTask:
             return None
 
         if prefer_right:
-            # 台車座標の y が小さい側が右側。
-            _, _, label, selected = min(
-                available, key=lambda item: (item[0], item[1])
+            # 台車座標の y が小さい側が右側。y はノイズで数 cm ずれるため、
+            # 一番右から knob_column_tolerance 以内は同じ列とみなし、
+            # その中では低い位置 (z が小さい) を先に開ける。
+            tolerance = self._float('knob_column_tolerance')
+            rightmost_y = min(item[0] for item in available)
+            column = [
+                item for item in available
+                if item[0] <= rightmost_y + tolerance
+            ]
+            _, _, label, selected = min(column, key=lambda item: item[1])
+            selection_rule = (
+                f'右側優先かつ低い位置 (同じ列とみなす幅 {tolerance:.3f} m, '
+                f'候補 {len(column)} 個)'
             )
-            selection_rule = '右側優先'
         else:
             # 右側を2つ開けた後の3つ目は左側だけを候補にし、その中で
             # 高さ(z)の低いものを優先する。

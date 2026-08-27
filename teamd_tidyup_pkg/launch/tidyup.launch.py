@@ -50,7 +50,7 @@ def yoloe_detection_actions(context, *args, **kwargs):
         Node(
             package='teamd_tidyup_pkg',
             executable='yoloe_detection_service',
-            name='yolov8_detection',
+            name=LaunchConfiguration('detection_node_name'),
             output='screen',
             parameters=[{
                 'image_topic': LaunchConfiguration('image_topic'),
@@ -61,6 +61,10 @@ def yoloe_detection_actions(context, *args, **kwargs):
                 'output_topic': LaunchConfiguration('output_topic'),
                 'model_path': expand_model_path(context),
             }],
+            remappings=[(
+                'yolov8_detection/service',
+                LaunchConfiguration('detection_service_name'),
+            )],
         ),
         Node(
             package='rviz2',
@@ -80,10 +84,10 @@ def yoloe_detection_actions(context, *args, **kwargs):
 
 
 def create_tidyup_sm_node():
-    """Return the state-machine node with the calibrated drawer driver."""
+    """Return the configured state-machine node with the calibrated driver."""
     return Node(
         package='teamd_tidyup_pkg',
-        executable='tidyup_sm',
+        executable=LaunchConfiguration('state_machine_executable'),
         name='teamd_tidyup',
         output='screen',
         # The calibrated drawer approach uses odom-frame waypoints. Keep it on
@@ -269,6 +273,21 @@ def generate_launch_description():
                 description=(
                     '物体検出の重みファイル (既定: 2_yolov11s_10.pt)'
                 ),
+            ),
+            DeclareLaunchArgument(
+                'detection_node_name',
+                default_value='yolov8_detection',
+                description='物体検出ノードの名前',
+            ),
+            DeclareLaunchArgument(
+                'detection_service_name',
+                default_value='yolov8_detection/service',
+                description='物体検出サービス名',
+            ),
+            DeclareLaunchArgument(
+                'state_machine_executable',
+                default_value='tidyup_sm',
+                description='起動する片付けステートマシンの executable',
             ),
             DeclareLaunchArgument(
                 'image_topic',
