@@ -250,8 +250,11 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 'use_rex_omni',
-                default_value='true',
-                description='YOLO未検出時のRex-Omni最終確認を有効にするか',
+                default_value='false',
+                description=(
+                    'YOLO未検出時のRex-Omni最終確認を有効にするか。'
+                    'recog.py の USE_REX_OMNI も True にする必要があります。'
+                ),
             ),
             DeclareLaunchArgument(
                 'rex_omni_weights_dir',
