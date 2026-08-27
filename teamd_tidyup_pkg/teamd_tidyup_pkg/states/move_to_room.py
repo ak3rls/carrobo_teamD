@@ -15,6 +15,8 @@ from yasmin import State
 ROOM_GOALS = {
     # 'roomA': [{'x': 6.960, 'y': -0.950, 'yaw': 0.977}],   #RViz
     'roomA': [
+        {'x': 3.40, 'y': -1.40, 'yaw': 0.54},
+        {'x': 3.80, 'y': -0.79, 'yaw': -0.10},
         {'x': 6.66, 'y': 0.481, 'yaw': 0.0},
     ],
     'roomB': [
