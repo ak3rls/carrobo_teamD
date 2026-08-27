@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """把持している物体を所定位置へ配置するステート."""
 
+import time
+
 from rclpy.node import Node
 from yasmin import Blackboard
 from yasmin import State
@@ -24,6 +26,10 @@ PLACE_JOINT_POSITIONS = {
 
 # 配置姿勢になった後、ハンドを開く前に前進する距離です。
 PLACE_FORWARD_DISTANCE = 0.20  # [m]
+
+# ハンドを開いた後、そのまま静止して待つ時間です。
+# すぐ動くと物体が指から離れきらず、一緒に持っていってしまいます。
+RELEASE_HOLD_TIME = 5.0  # [s]
 # ---------------------------------------------------------------------------
 
 
@@ -37,7 +43,7 @@ class PlaceState(State):
         self.hsrif = hsrif
 
     def execute(self, blackboard: Blackboard) -> str:
-        """配置姿勢へ遷移し、20 cm 前進してからハンドを開く."""
+        """配置姿勢へ遷移し、ハンドを開いてから静止して物体を離す."""
         self.node.get_logger().info('Executing state Place')
 
         try:
@@ -45,7 +51,14 @@ class PlaceState(State):
                 PLACE_JOINT_POSITIONS,
                 sync=True,
             )
-            self.hsrif.gripper.command(1.0)
+            self.hsrif.gripper.command(1.0, sync=True)
+
+            # 開いた直後に動くと、物体が指に引っかかったまま運ばれます。
+            # 開いた姿勢のまま静止して、確実に落としてから次へ進みます。
+            self.node.get_logger().info(
+                f'ハンドを開いたまま {RELEASE_HOLD_TIME:.0f} 秒待ちます。'
+            )
+            time.sleep(RELEASE_HOLD_TIME)
         # hsrb_interface の動作例外をステート失敗へ変換します。
         except Exception as error:
             self.node.get_logger().error(f'配置動作に失敗しました: {error}')

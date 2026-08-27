@@ -68,7 +68,7 @@ class TidyupStateMachineNode(Node):
         )
         self.state_machine.add_state(
             name='Recog',
-            state=RecogState(self, self.hsrif, self.tf_buffer),
+            state=RecogState(self, self.hsrif, self.tf_buffer, self.nav),
             transitions={
                 'succeeded': 'Grasp',
                 'failed': 'Recog',

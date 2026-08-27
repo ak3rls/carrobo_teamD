@@ -10,6 +10,7 @@ import numpy as np
 import rclpy
 import tf2_geometry_msgs  # noqa: F401
 import tf_transformations as tft
+from geometry_msgs.msg import Pose2D
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Quaternion
 from grasp_point_detection_interfaces.srv import GraspPointService
@@ -37,37 +38,99 @@ from carrobo_manipulation_pkg.hsrif import HSRInterfaces
 # ロボット自身を選ぶ可能性があるため、通常は物体名を指定してください。
 TARGET_NAME = ''
 
-CONFIDENCE_THRESHOLD = 0.25
+# 検出されても把持対象にしない物体名です。
+# 比較は大文字小文字を無視するので、小文字で書いてください。
+EXCLUDED_NAMES = {
+    'rubiks',
+    '9-peg',
+    'lego',
+}
+
+CONFIDENCE_THRESHOLD = 0.5
 MAX_GRASP_DISTANCE = 2.0
 DEPTH_SCALES = {
     '16UC1': 0.001,
     '32FC1': 1.0,
 }
 TALL_THRESHOLD = 0.15
+# 横把持で、物体の手前どれだけの位置にプリグラスプを置くか [m]。
+# 物体に近い位置で把持姿勢を作ると、腕を振り込む途中で物体に当たります。
+# 遠くで姿勢を作ってからまっすぐ寄せるほうが当たりにくくなります。
+SIDE_GRASP_PREGRASP_DISTANCE = 0.15
+# 横把持で、プリグラスプからまっすぐ伸ばす距離 [m]。
+# プリグラスプ距離との差が、hand_palm_link と把持点のすき間になります。
+# 伸ばしすぎると指が物体を突き抜けて GOAL_IN_COLLISION になるので、
+# 当たるようなら小さくしてください。
+SIDE_GRASP_APPROACH_DISTANCE = 0.15
+# プリグラスプは接近方向に沿ってロボット側へ下げるので、下げすぎると
+# 手が base_link に近づきすぎ、ロボット自身と干渉して
+# START_STATE_IN_COLLISION になります。これより近くには置きません。
+MIN_PREGRASP_RADIUS = 0.40
+# 把持位置の床からの高さ [m] の下限です。base_link の z=0 が床面なので、
+# 推定値をそのまま使うと平たい物体でグリッパが床に食い込みます。
+MIN_GRASP_HEIGHT = 0.022
+# wrist_roll_joint の可動域 [rad] (hsrb_description の URDF より)。
+# whole_body.joint_limits が引けなかったときのフォールバックです。
+WRIST_ROLL_LIMITS = (-1.92, 3.67)
 HEAD_TILT = math.radians(-50.0)
-MAX_EMPTY_DETECTIONS = 3
+# 認識するときのグリッパの開き角 [rad]。0.0 で閉じます。
+# 開いたままだと指がカメラの視界に入ります。Grasp が最初に開くので、
+# ここで閉じておいても把持には影響しません。
+RECOG_GRIPPER_ANGLE = 0.0
+# YOLO がこの回数だけ連続で物体を見つけられなかったら Rex-Omni へ移ります。
+# 1 なら 1 回目の未検出で即座に Rex-Omni を試します。
+# 下の向き直しを使い切ってからこの回数を数えます。
+MAX_EMPTY_DETECTIONS = 1
+
+# YOLO が空振りしたとき、その場で体の向きを変えてもう一度試す部屋です。
+ROTATION_RETRY_ROOMS = {'roomA'}
+# 1 つの部屋で向きを変えて試す回数です。
+MAX_ROTATION_RETRIES = 1
+# 1 回あたりの回頭量 [rad]。正で左回り、負で右回りです。
+ROTATION_RETRY_YAW = math.radians(60.0)
+
+# False にすると Rex-Omni を一切呼ばず、YOLO と下の正面向き再試行だけで
+# 探索します。モデルのロードを伴わないぶん速く終わります。
+USE_REX_OMNI = False
+
+# 他で駄目だったとき、机の上を見るために首を正面に向けて YOLO を
+# 1度だけ試す部屋です。
+FORWARD_RETRY_ROOMS = {'roomA', 'roomB'}
+# そのときのヘッドの傾き [rad]。0.0 で正面です。全部屋で共通です。
+FORWARD_HEAD_TILT = 0.0
+# 机の上を見に行くときの立ち位置 (map 座標系) を部屋ごとに指定します。
+# 指定が無い部屋では移動せず、回した分だけ戻して 0 度で見ます。
+FORWARD_RETRY_POSES = {
+    'roomB': {'x': 6.9, 'y': 3.59, 'yaw': 0.0,
+    },
+}
+
+# 検出できなかったときに移動して観測し直す位置です (map 座標系)。
+# 上から順に1回ずつ使います。部屋の指定が無ければ移動しません。
+EXTRA_VIEWPOINTS = {
+    'roomB': [
+        {'x': 6.848, 'y':  4.283, 'yaw': -1.060},
+    ],
+}
+# 観測位置への移動の制限時間 [s]。0.0 は到着するまで待ちます。
+VIEWPOINT_NAVIGATION_TIMEOUT = 0.0
 REX_OMNI_PROMPT = 'object'
 REX_OMNI_DETECTION_SERVICE = '/rex_omni_sam2/object_detection'
 REX_OMNI_START_SERVICE = '/rex_omni/start'
 REX_OMNI_STOP_SERVICE = '/rex_omni/stop'
 REX_OMNI_SERVICE_TIMEOUT = 10.0
+# TF 変換を待つ最大時間 [s]。
+TF_WAIT_TIMEOUT = 2.0
+# TF 変換の失敗だけで候補が無くなったとき、画像を撮り直して選び直す回数。
+# 撮り直すとタイムスタンプが更新されるので、時刻ズレが原因なら解消します。
+MAX_TF_RETRY_DETECTIONS = 2
 
 
-def _box_aligned_grasp_orientation(
-    box_orientation: Quaternion,
-    side_grasp: bool,
-    object_xy,
-):
-    """
-    Align the gripper closing axis with the object's horizontal short edge.
+def _horizontal_long_axis(box_orientation: Quaternion):
+    """物体の水平な長辺方向の単位ベクトルを返す.
 
-    The grasp-point service defines the box-local X axis as the long edge and
-    Y as the short edge.  The HSR hand closes along its local Y axis and
-    approaches along local +Z.
-
-    For a side grasp, the PCA long axis has an arbitrary sign.  Select the
-    sign pointing from the robot toward the object so the pre-grasp offset is
-    placed on the robot-facing end of the object.
+    把持点推定サービスは、箱のローカル X 軸を長辺、Y 軸を短辺と定めています。
+    上把持では、この向きに手首を合わせて短辺を挟みます。
     """
     box_quaternion = np.array(
         [
@@ -80,43 +143,50 @@ def _box_aligned_grasp_orientation(
     )
     box_quaternion /= np.linalg.norm(box_quaternion)
 
-    box_rotation = tft.quaternion_matrix(box_quaternion)[:3, :3]
-    long_axis = box_rotation[:, 0].copy()
+    long_axis = tft.quaternion_matrix(box_quaternion)[:3, 0].copy()
     long_axis[2] = 0.0
-    long_axis_norm = np.linalg.norm(long_axis)
-    if long_axis_norm < np.finfo(np.float64).eps:
+    norm = np.linalg.norm(long_axis)
+    if norm < np.finfo(np.float64).eps:
         raise ValueError('物体の水平長辺方向を計算できません。')
-    long_axis /= long_axis_norm
+    return long_axis / norm
 
-    if side_grasp and np.dot(long_axis[:2], object_xy) < 0.0:
-        half_turn = tft.quaternion_from_euler(0.0, 0.0, math.pi)
-        box_quaternion = tft.quaternion_multiply(
-            box_quaternion,
-            half_turn,
-        )
-        long_axis *= -1.0
 
-    if side_grasp:
-        grasp_offset = tft.quaternion_from_euler(
-            math.pi,
-            -math.pi / 2.0,
-            0.0,
-        )
-    else:
-        grasp_offset = tft.quaternion_from_euler(math.pi, 0.0, 0.0)
+def _front_grasp_orientation(object_xy):
+    """ロボットから物体へまっすぐ手を伸ばす横把持の姿勢を作る.
 
-    grasp_quaternion = tft.quaternion_multiply(
-        box_quaternion,
-        grasp_offset,
+    物体の長辺方向から近づこうとすると、その向きによっては台車が大きく
+    回り込む必要が出ます。背の高い物体は正面から挟めれば十分なので、
+    接近方向をロボットから物体へ向かう水平方向に固定します。
+
+    できあがる手先姿勢は rpy(pi, -pi/2, yaw) で、
+    ローカル +Z (接近方向) が物体の方向、
+    ローカル Y (グリッパが閉じる方向) が水平でそれに直交、
+    ローカル X が鉛直上向きになります。
+
+    Args:
+        object_xy: base_link 基準の物体の水平位置 (x, y)。
+
+    Returns:
+        (手先姿勢, 接近方向の単位ベクトル)。
+    """
+    direction = np.array(
+        [float(object_xy[0]), float(object_xy[1]), 0.0],
+        dtype=np.float64,
     )
-    grasp_quaternion /= np.linalg.norm(grasp_quaternion)
+    norm = np.linalg.norm(direction)
+    if norm < np.finfo(np.float64).eps:
+        raise ValueError('物体がロボットの真上または真下にあります。')
+    direction /= norm
+
+    yaw = math.atan2(direction[1], direction[0])
+    quaternion = tft.quaternion_from_euler(math.pi, -math.pi / 2.0, yaw)
     orientation = Quaternion(
-        x=float(grasp_quaternion[0]),
-        y=float(grasp_quaternion[1]),
-        z=float(grasp_quaternion[2]),
-        w=float(grasp_quaternion[3]),
+        x=float(quaternion[0]),
+        y=float(quaternion[1]),
+        z=float(quaternion[2]),
+        w=float(quaternion[3]),
     )
-    return orientation, long_axis
+    return orientation, direction
 
 
 class RecogState(State):
@@ -127,13 +197,42 @@ class RecogState(State):
         node: Node,
         hsrif: HSRInterfaces,
         tf_buffer: Buffer,
+        nav=None,
     ):
-        """サービスクライアントを生成する."""
+        """サービスクライアントを生成する.
+
+        Args:
+            node: このステートを動かすノード。
+            hsrif: ロボットのインターフェース。
+            tf_buffer: カメラ座標系から base_link へ変換するための Buffer。
+            nav: 観測位置へ移動するための NavModule。None なら移動しません。
+        """
         super().__init__(outcomes=['succeeded', 'failed', 'none'])
         self.node = node
         self.hsrif = hsrif
         self.tf_buffer = tf_buffer
+        self.nav = nav
         self.empty_detection_count = 0
+        # 向き直しは部屋ごとに数え直すので、いまいる部屋を覚えておきます。
+        self.current_room = None
+        self.rotation_retry_count = 0
+        self.forward_retry_done = False
+        # この部屋で既に把持対象にした物体名です (小文字)。
+        # 把持に失敗しても同じ物体を掴み直さないよう、候補から外します。
+        self.attempted_names = set()
+        # 直前の _select_target で TF 変換に失敗した候補があったかどうか。
+        self.tf_error_in_selection = False
+        # この部屋で次に使う観測位置の添字です。
+        self.viewpoint_index = 0
+        # この部屋でこれまでに回した合計角度 [rad]。把持後に
+        # Move2GraspPoint が固定姿勢へ戻すので、戻された分を掛け直します。
+        self.applied_rotation = 0.0
+        # この部屋で最後に移動した観測位置。把持後に Move2GraspPoint が
+        # 既定の位置へ戻すので、次に来たときはここへ戻ります。
+        self.current_viewpoint = None
+        # 直前にこのステートが succeeded を返したか。真なら把持サイクルを
+        # 一周して台車の位置と向きが戻されています。
+        self.returned_after_grasp = False
         self.bridge = CvBridgeUtils()
 
         self.detect_client = self.node.create_client(
@@ -205,8 +304,67 @@ class RecogState(State):
         )
         return True
 
-    def _convert_rex_detections(self, detections) -> ObjectDetection:
-        """Rex-Omni+SAM2の圧縮画像結果を既存YOLO形式へ変換する."""
+    def _decode_rex_depth(self, compressed_depth):
+        """Rex-Omniの圧縮深度画像を復元する。使えなければ None を返す.
+
+        depth_is_compressed=false で起動していると、Rex-Omni 側は
+        cv2_to_compressed_imgmsg(dst_format='png') で詰め直すため、
+        format が単なる 'png' になり深度のエンコーディングが失われます。
+        その場合 8bit へ落ちていることがあり、深度としては使えません。
+        """
+        if not compressed_depth.data:
+            self.node.get_logger().warning(
+                'Rex-Omni検出結果に深度画像がありません。'
+            )
+            return None
+
+        if 'compresseddepth' in compressed_depth.format.lower():
+            depth = self.bridge.compressed_imgmsg_to_depth(compressed_depth)
+        else:
+            depth = cv2.imdecode(
+                np.frombuffer(compressed_depth.data, dtype=np.uint8),
+                cv2.IMREAD_UNCHANGED,
+            )
+        if depth is None:
+            self.node.get_logger().warning(
+                'Rex-Omniの圧縮深度画像を復元できませんでした '
+                f'(format={compressed_depth.format!r})。'
+            )
+            return None
+
+        depth = np.asarray(depth)
+        if depth.dtype == np.uint16:
+            depth_encoding = '16UC1'
+        elif depth.dtype == np.float32:
+            depth_encoding = '32FC1'
+        else:
+            # 8bit まで落ちた深度は mm 単位の距離として復元できません。
+            self.node.get_logger().warning(
+                'Rex-Omniの深度画像型に対応していません: '
+                f'{depth.dtype} (format={compressed_depth.format!r})。'
+            )
+            return None
+
+        depth_msg = self.bridge.cv2_to_imgmsg(
+            depth,
+            encoding=depth_encoding,
+        )
+        depth_msg.header = compressed_depth.header
+        return depth_msg
+
+    def _convert_rex_detections(
+        self,
+        detections,
+        fallback_depth=None,
+    ) -> ObjectDetection:
+        """Rex-Omni+SAM2の圧縮画像結果を既存YOLO形式へ変換する.
+
+        Args:
+            detections: Rex-Omni+SAM2 の検出結果。
+            fallback_depth: Rex-Omni の深度が使えなかったときに代わりに使う
+                sensor_msgs/Image。YOLO 応答の深度を渡します。ロボットは
+                Recog の間停止しているので、同じ画角のものとして扱えます。
+        """
         converted = ObjectDetection()
         converted.header = detections.header
         converted.is_detected = detections.is_detected
@@ -214,34 +372,31 @@ class RecogState(State):
 
         if not detections.bbox:
             return converted
-        if not detections.depth.data:
-            raise ValueError('Rex-Omni検出結果に深度画像がありません。')
 
-        if 'compresseddepth' in detections.depth.format.lower():
-            depth = self.bridge.compressed_imgmsg_to_depth(detections.depth)
-        else:
-            depth = cv2.imdecode(
-                np.frombuffer(detections.depth.data, dtype=np.uint8),
-                cv2.IMREAD_UNCHANGED,
+        depth_msg = self._decode_rex_depth(detections.depth)
+        if depth_msg is None:
+            if fallback_depth is None or not fallback_depth.data:
+                raise ValueError(
+                    'Rex-Omniの深度画像が使えず、代わりの深度もありません。'
+                )
+            self.node.get_logger().warning(
+                'Rex-Omniの深度画像が使えないため、'
+                'YOLO応答の深度画像で代用します '
+                f'(encoding={fallback_depth.encoding})。'
             )
-        if depth is None:
-            raise ValueError('Rex-Omniの圧縮深度画像を変換できません。')
-        depth = np.asarray(depth)
-        if depth.dtype == np.uint16:
-            depth_encoding = '16UC1'
-        elif depth.dtype == np.float32:
-            depth_encoding = '32FC1'
-        else:
+            depth_msg = fallback_depth
+
+        if depth_msg.encoding not in DEPTH_SCALES:
             raise ValueError(
-                'Rex-Omniの深度画像型に対応していません: '
-                f'{depth.dtype}'
+                '代用した深度画像のエンコーディングに対応していません: '
+                f'{depth_msg.encoding}'
             )
 
-        converted.depth = self.bridge.cv2_to_imgmsg(
-            depth,
-            encoding=depth_encoding,
+        depth = self.bridge.imgmsg_to_cv2(
+            depth_msg,
+            desired_encoding=depth_msg.encoding,
         )
-        converted.depth.header = detections.depth.header
+        converted.depth = depth_msg
 
         if len(detections.segments) < len(detections.bbox):
             raise ValueError(
@@ -285,8 +440,13 @@ class RecogState(State):
 
         return converted
 
-    def _detect_with_rex_omni(self):
-        """Rex-Omniを1視点・1フレームだけ実行する."""
+    def _detect_with_rex_omni(self, fallback_depth=None):
+        """Rex-Omniを1視点・1フレームだけ実行する.
+
+        Args:
+            fallback_depth: Rex-Omni の深度が使えなかったときに使う
+                sensor_msgs/Image。YOLO 応答の深度を渡します。
+        """
         if not self._wait_for_rex_service(
             self.rex_detect_client,
             REX_OMNI_DETECTION_SERVICE,
@@ -317,7 +477,10 @@ class RecogState(State):
                 return None
 
             try:
-                return self._convert_rex_detections(response.detections)
+                return self._convert_rex_detections(
+                    response.detections,
+                    fallback_depth=fallback_depth,
+                )
             except (TypeError, ValueError) as error:
                 self.node.get_logger().error(
                     f'Rex-Omni検出結果を変換できませんでした: {error}'
@@ -329,12 +492,378 @@ class RecogState(State):
                     'Rex-Omniモデルを停止できませんでした。'
                 )
 
+    def _reset_for_room(self, blackboard: Blackboard) -> None:
+        """部屋が変わったら、未検出回数と向き直し回数を数え直す."""
+        room = (
+            blackboard.current_room
+            if 'current_room' in blackboard
+            else None
+        )
+        if room != self.current_room:
+            self.current_room = room
+            self.empty_detection_count = 0
+            self.rotation_retry_count = 0
+            self.forward_retry_done = False
+            self.attempted_names = set()
+            self.viewpoint_index = 0
+            self.applied_rotation = 0.0
+            self.current_viewpoint = None
+            self.returned_after_grasp = False
+
+    def _rotate_and_retry(self) -> bool:
+        """向きを変えてもう一度 YOLO を試せるなら回頭して True を返す.
+
+        Rex-Omni はモデルのロードを伴って重いので、その前に体の向きを
+        変えて安い YOLO をもう一度試します。回頭できたら失敗として戻り、
+        ステートマシンの自己ループで Recog をやり直します。
+        """
+        if self.current_room not in ROTATION_RETRY_ROOMS:
+            return False
+        if self.rotation_retry_count >= MAX_ROTATION_RETRIES:
+            return False
+
+        self.rotation_retry_count += 1
+        degrees = math.degrees(ROTATION_RETRY_YAW)
+        self.node.get_logger().info(
+            f'{self.current_room} で物体を検出できなかったため、'
+            f'{degrees:.0f} 度向きを変えてもう一度 YOLO を試します '
+            f'({self.rotation_retry_count}/{MAX_ROTATION_RETRIES})。'
+        )
+        if not self._rotate_base(ROTATION_RETRY_YAW):
+            return False
+        self.applied_rotation += ROTATION_RETRY_YAW
+        return True
+
+    def _rotate_base(self, yaw: float) -> bool:
+        """台車をその場で回す。失敗しても止めずに False を返す."""
+        try:
+            self.hsrif.omni_base.go_rel(yaw=yaw, sync=True)
+        # 回頭できなくても先の探索へ進めるよう、失敗は握りつぶします。
+        except Exception as error:
+            self.node.get_logger().warning(
+                f'向きを変えられませんでした: {error}'
+            )
+            return False
+        return True
+
+    def _restore_observation_pose(self) -> None:
+        """把持サイクルで戻された観測姿勢を、前回検出できた状態に戻す.
+
+        Move2GraspPoint が既定の位置へナビゲーションし直すため、前回この
+        部屋で移動した観測位置と回した角度は失われています。毎回そこから
+        確認し直すのは無駄なので、検出する前に同じ状態まで戻します。
+        """
+        if not self.returned_after_grasp:
+            return
+        self.returned_after_grasp = False
+        self._restore_viewpoint()
+        self._restore_rotation()
+
+    def _restore_viewpoint(self) -> None:
+        """前回検出できた観測位置へ戻る (roomB など)."""
+        if self.current_viewpoint is None:
+            return
+        if self.nav is None:
+            return
+
+        goal = self.current_viewpoint
+        self.node.get_logger().info(
+            f'{self.current_room} では前回 '
+            f'x={goal.x:.2f}, y={goal.y:.2f}, yaw={goal.theta:.2f} で検出'
+            'できたので、検出前にそこへ戻ります。'
+        )
+        if not self.nav.nav_goal(
+            goal=goal,
+            timeout=VIEWPOINT_NAVIGATION_TIMEOUT,
+        ):
+            self.node.get_logger().warning(
+                f'観測位置へ戻れませんでした: {self.nav.nav_status.message}'
+            )
+
+    def _restore_rotation(self) -> None:
+        """前回検出できた向きまで回し直す (roomA など)."""
+        if self.applied_rotation == 0.0:
+            return
+
+        degrees = math.degrees(self.applied_rotation)
+        self.node.get_logger().info(
+            f'{self.current_room} では前回 {degrees:.0f} 度回して検出'
+            'できたので、検出前に同じ角度まで回します。'
+        )
+        self._rotate_base(self.applied_rotation)
+
+    def _transform_pose(
+        self,
+        stamped: PoseStamped,
+        target_frame: str,
+        timeout: float = TF_WAIT_TIMEOUT,
+    ):
+        """ノードを回しながら姿勢を target_frame へ変換する.
+
+        このノードは rclpy.spin() で回り続けていません。tf2 側の timeout に
+        任せると、待っている間に /tf を受け取れず、画像のタイムスタンプが
+        最新 TF より数十 ms 新しいだけで必ず extrapolation エラーになります。
+        自分で spin しながら、変換できるようになるまで待ちます。
+
+        Args:
+            stamped: 変換したい姿勢。
+            target_frame: 変換先のフレーム。
+            timeout: あきらめるまでの時間 [s]。
+
+        Returns:
+            変換後の geometry_msgs/Pose。
+
+        Raises:
+            TransformException: 時間内に変換できなかった場合。
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return self.tf_buffer.transform(
+                    stamped,
+                    target_frame,
+                    timeout=Duration(seconds=0.0),
+                ).pose
+            except TransformException:
+                if time.monotonic() >= deadline:
+                    raise
+            # /tf を受け取るために回します。これが無いと永久に届きません。
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+
+    def _look_and_detect(self, head_tilt: float, move_head: bool = True):
+        """ヘッドを指定の傾きに向けて YOLO を1回実行する.
+
+        Args:
+            head_tilt: head_tilt_joint の目標角 [rad]。0.0 で正面。
+            move_head: False なら姿勢はそのままで撮り直しだけ行います。
+                同じ画角で新しいタイムスタンプの画像が欲しいときに使います。
+
+        Returns:
+            検出結果。サービスから応答が無ければ None。
+        """
+        if move_head:
+            try:
+                # 腕は動かしません。move_to_go で作られた初期姿勢のまま、
+                # 首だけを向けます。認識のたびに腕を出すと邪魔になります。
+                self.hsrif.gripper.command(
+                    RECOG_GRIPPER_ANGLE,
+                    sync=True,
+                )
+                self.hsrif.whole_body.move_to_joint_positions(
+                    {'head_pan_joint': 0.0, 'head_tilt_joint': head_tilt},
+                    sync=True,
+                )
+            # 直前の動作で衝突状態のまま止まっていると
+            # START_STATE_IN_COLLISION で例外が飛びます。ここで受けないと
+            # ステートマシンごと落ちるので、失敗として扱います。
+            except Exception as error:
+                self.node.get_logger().error(
+                    f'認識姿勢へ移動できませんでした: {error}'
+                )
+                return None
+            time.sleep(2.0)
+
+        # TF を受信して Buffer に溜めてからサービスを呼びます。
+        for _ in range(20):
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+
+        detect_req = ObjectDetectionService.Request()
+        detect_req.confidence_th = CONFIDENCE_THRESHOLD
+        future = self.detect_client.call_async(detect_req)
+        rclpy.spin_until_future_complete(self.node, future)
+        response = future.result()
+        if response is None:
+            self.node.get_logger().error(
+                '物体検出サービスから応答がありません。'
+            )
+            return None
+        return response.detections
+
+    def _move_to_forward_pose(self) -> None:
+        """机の上を見る姿勢を作る.
+
+        立ち位置が指定されている部屋ではそこへ移動します。指定が無ければ
+        移動せず、回した分だけ戻して体の向きを 0 度にします。
+        """
+        pose = FORWARD_RETRY_POSES.get(self.current_room)
+        if pose is not None and self.nav is not None:
+            if (
+                pose['x'] is None
+                or pose['y'] is None
+                or pose['yaw'] is None
+            ):
+                self.node.get_logger().warning(
+                    f'{self.current_room} の机を見る立ち位置が未設定です。'
+                    'その場で首だけ正面に向けます。'
+                )
+            else:
+                goal = Pose2D(
+                    x=float(pose['x']),
+                    y=float(pose['y']),
+                    theta=float(pose['yaw']),
+                )
+                self.node.get_logger().info(
+                    f'机の上を見るため '
+                    f'x={goal.x:.2f}, y={goal.y:.2f}, '
+                    f'yaw={goal.theta:.2f} へ移動します。'
+                )
+                if self.nav.nav_goal(
+                    goal=goal,
+                    timeout=VIEWPOINT_NAVIGATION_TIMEOUT,
+                ):
+                    # 移動で向きも決まったので、回した角度は忘れます。
+                    self.applied_rotation = 0.0
+                    # ここで見つかったなら、次のサイクルもここから始めます。
+                    self.current_viewpoint = goal
+                    return
+                self.node.get_logger().warning(
+                    f'机を見る立ち位置へ移動できませんでした: '
+                    f'{self.nav.nav_status.message}'
+                )
+
+        # 机は既定の向きの正面にあるので、回した分を戻してから見ます。
+        if self.applied_rotation != 0.0:
+            degrees = math.degrees(self.applied_rotation)
+            self.node.get_logger().info(
+                f'机の上を見るため、回した {degrees:.0f} 度を戻して'
+                '体の向きを 0 度にします。'
+            )
+            if self._rotate_base(-self.applied_rotation):
+                # 以降はこの向きが基準になります。把持サイクルから
+                # 戻ったときに古い角度を掛け直さないよう忘れます。
+                self.applied_rotation = 0.0
+
+    def _forward_yolo_retry(self):
+        """首を正面に向けた YOLO を1度だけ試す.
+
+        Rex-Omni でも見つからなかったときの最後の手段です。俯いた姿勢では
+        画角から外れる、離れた場所の物体を拾うことを狙います。ここで駄目でも
+        Rex-Omni は再実行しません。
+
+        Returns:
+            (検出結果, 添字)。試さなかった、または見つからなければ None。
+        """
+        if self.current_room not in FORWARD_RETRY_ROOMS:
+            return None
+        if self.forward_retry_done:
+            return None
+
+        self.forward_retry_done = True
+        self._move_to_forward_pose()
+
+        self.node.get_logger().info(
+            f'{self.current_room} なので、首を正面に向けて '
+            'YOLO をもう一度だけ試します。'
+        )
+        detections = self._look_and_detect(FORWARD_HEAD_TILT)
+        if detections is None:
+            return None
+
+        names = [bbox.name for bbox in detections.bbox]
+        self.node.get_logger().info(f'正面向きで検出した物体: {names}')
+
+        index = self._select_target(detections)
+        if index < 0:
+            self.node.get_logger().info(
+                '正面向きでも物体を検出できませんでした。'
+            )
+            return None
+        return detections, index
+
+    def _move_to_next_viewpoint(self) -> bool:
+        """次の観測位置へ移動できたら True を返す.
+
+        その部屋に残っている観測位置を上から順に1回ずつ使います。
+        移動できたら失敗として戻り、ステートマシンの自己ループで
+        Recog を最初からやり直します。
+        """
+        viewpoints = EXTRA_VIEWPOINTS.get(self.current_room, [])
+        if self.viewpoint_index >= len(viewpoints):
+            return False
+        if self.nav is None:
+            self.node.get_logger().warning(
+                'NavModule が渡されていないため、観測位置へ移動できません。'
+            )
+            return False
+
+        viewpoint = viewpoints[self.viewpoint_index]
+        self.viewpoint_index += 1
+        if (
+            viewpoint['x'] is None
+            or viewpoint['y'] is None
+            or viewpoint['yaw'] is None
+        ):
+            self.node.get_logger().warning(
+                f'{self.current_room} の {self.viewpoint_index} 番目の'
+                '観測位置が未設定なので飛ばします。'
+            )
+            return False
+
+        goal = Pose2D(
+            x=float(viewpoint['x']),
+            y=float(viewpoint['y']),
+            theta=float(viewpoint['yaw']),
+        )
+        self.node.get_logger().info(
+            f'{self.current_room} で検出できなかったため、'
+            f'{self.viewpoint_index}/{len(viewpoints)} 番目の観測位置 '
+            f'x={goal.x:.2f}, y={goal.y:.2f}, yaw={goal.theta:.2f} へ'
+            '移動して検出し直します。'
+        )
+        if not self.nav.nav_goal(
+            goal=goal,
+            timeout=VIEWPOINT_NAVIGATION_TIMEOUT,
+        ):
+            self.node.get_logger().warning(
+                f'観測位置へ移動できませんでした: '
+                f'{self.nav.nav_status.message}'
+            )
+            return False
+        # 次に把持サイクルから戻ってきたときは、ここから検出を始めます。
+        self.current_viewpoint = goal
+        return True
+
+    def _is_excluded(self, name: str) -> bool:
+        """把持対象から外す物体かどうかを返す.
+
+        EXCLUDED_NAMES の指定と、この部屋で既に把持対象にしたものが対象です。
+        """
+        lowered = name.lower()
+        return lowered in EXCLUDED_NAMES or lowered in self.attempted_names
+
     def _select_target(self, detections) -> int:
-        """対象名に一致する検出のうち、ロボットに最も近い添字を返す."""
+        """対象名に一致する検出のうち、ロボットに最も近い添字を返す.
+
+        EXCLUDED_NAMES の物体と、この部屋で既に把持対象にした物体は、
+        検出されていても候補から外します。後者があるおかげで、Grasp が
+        失敗して Recog に戻っても同じ物体を掴み直さずに済みます。
+        """
+        excluded_names = [
+            bbox.name
+            for bbox in detections.bbox
+            if bbox.name.lower() in EXCLUDED_NAMES
+        ]
+        if excluded_names:
+            self.node.get_logger().info(
+                f'除外指定の物体なので把持対象から外します: {excluded_names}'
+            )
+
+        attempted = [
+            bbox.name
+            for bbox in detections.bbox
+            if bbox.name.lower() in self.attempted_names
+        ]
+        if attempted:
+            self.node.get_logger().info(
+                f'既に把持対象にしたので候補から外します: {attempted}'
+            )
+
+        self.tf_error_in_selection = False
         candidate_indices = [
             index
             for index, bbox in enumerate(detections.bbox)
-            if not TARGET_NAME or bbox.name == TARGET_NAME
+            if not self._is_excluded(bbox.name)
+            and (not TARGET_NAME or bbox.name == TARGET_NAME)
         ]
         if not candidate_indices:
             return -1
@@ -426,12 +955,9 @@ class RecogState(State):
             stamped.pose.position.z = float(camera_z)
             stamped.pose.orientation.w = 1.0
             try:
-                base_pose = self.tf_buffer.transform(
-                    stamped,
-                    'base_link',
-                    timeout=Duration(seconds=2.0),
-                ).pose
+                base_pose = self._transform_pose(stamped, 'base_link')
             except TransformException as error:
+                self.tf_error_in_selection = True
                 self.node.get_logger().warning(
                     f'{bbox.name} の距離を base_link 基準に変換'
                     f'できませんでした: {error}'
@@ -460,6 +986,7 @@ class RecogState(State):
     def execute(self, blackboard: Blackboard) -> str:
         """対象物体を認識し、把持前姿勢を Blackboard に保存する."""
         self.node.get_logger().info('Executing state Recog')
+        self._reset_for_room(blackboard)
 
         if not self._wait_for_service(
             self.detect_client, '/yolov8_detection/service'
@@ -470,36 +997,44 @@ class RecogState(State):
         ):
             return 'failed'
 
-        # move_to_go はカメラを腕で隠すため、認識時は neutral 姿勢です。
-        self.hsrif.whole_body.move_to_neutral(sync=True)
-        self.hsrif.whole_body.move_to_joint_positions(
-            {'head_pan_joint': 0.0, 'head_tilt_joint': HEAD_TILT},
-            sync=True,
-        )
-        time.sleep(2.0)
+        self._restore_observation_pose()
 
-        # TF を受信して Buffer に溜めてからサービスを呼びます。
-        for _ in range(20):
-            rclpy.spin_once(self.node, timeout_sec=0.1)
-
-        detect_req = ObjectDetectionService.Request()
-        detect_req.confidence_th = CONFIDENCE_THRESHOLD
-        future = self.detect_client.call_async(detect_req)
-        rclpy.spin_until_future_complete(self.node, future)
-        response = future.result()
-
-        if response is None:
-            self.node.get_logger().error(
-                '物体検出サービスから応答がありません。'
-            )
+        detections = self._look_and_detect(HEAD_TILT)
+        if detections is None:
             return 'failed'
 
-        detections = response.detections
         names = [bbox.name for bbox in detections.bbox]
         self.node.get_logger().info(f'検出した物体: {names}')
 
         index = self._select_target(detections)
+
+        # 候補はあったのに TF 変換の失敗だけで選べなかった場合は、
+        # 画像を撮り直してタイムスタンプを更新し、選び直します。
+        # 姿勢はそのままなので、撮り直しは 1 秒程度で終わります。
+        for retry in range(1, MAX_TF_RETRY_DETECTIONS + 1):
+            if index >= 0 or not self.tf_error_in_selection:
+                break
+            self.node.get_logger().warning(
+                'TF 変換に失敗して候補が無くなりました。'
+                f'撮り直して選び直します ({retry}/'
+                f'{MAX_TF_RETRY_DETECTIONS})。'
+            )
+            detections = self._look_and_detect(HEAD_TILT, move_head=False)
+            if detections is None:
+                return 'failed'
+            names = [bbox.name for bbox in detections.bbox]
+            self.node.get_logger().info(f'撮り直して検出した物体: {names}')
+            index = self._select_target(detections)
+
         if index < 0:
+            # Rex-Omni へ移る前に、向きを変えて YOLO をもう一度試します。
+            if self._rotate_and_retry():
+                return 'failed'
+
+            # 次に、別の位置へ移動して検出し直します。
+            if self._move_to_next_viewpoint():
+                return 'failed'
+
             self.empty_detection_count = min(
                 self.empty_detection_count + 1,
                 MAX_EMPTY_DETECTIONS,
@@ -510,44 +1045,73 @@ class RecogState(State):
                 f'({self.empty_detection_count}/{MAX_EMPTY_DETECTIONS})。'
             )
             if self.empty_detection_count >= MAX_EMPTY_DETECTIONS:
-                self.node.get_logger().info(
-                    f'{MAX_EMPTY_DETECTIONS}回連続で物体を検出できなかったため、'
-                    'Rex-Omniで最終確認します。'
-                )
-                rex_detections = self._detect_with_rex_omni()
-                if rex_detections is None:
-                    return 'failed'
-
-                rex_names = [bbox.name for bbox in rex_detections.bbox]
-                self.node.get_logger().info(
-                    f'Rex-Omniが検出した物体: {rex_names}'
-                )
-                if not rex_detections.bbox:
-                    self.empty_detection_count = 0
+                rex_detections = None
+                rex_index = -1
+                if not USE_REX_OMNI:
                     self.node.get_logger().info(
-                        'Rex-Omniでも物体を検出しなかったため、'
-                        'none を返します。'
+                        'Rex-Omni は無効なので実行しません。'
                     )
-                    return 'none'
+                else:
+                    self.node.get_logger().info(
+                        f'{MAX_EMPTY_DETECTIONS}回連続で物体を検出'
+                        'できなかったため、Rex-Omniで最終確認します。'
+                    )
+                    # Rex-Omni は最終確認なので、駄目でも再実行はしません。
+                    rex_detections = self._detect_with_rex_omni(
+                        fallback_depth=detections.depth,
+                    )
+                    if rex_detections is None:
+                        self.node.get_logger().warning(
+                            'Rex-Omniを実行できませんでした。'
+                        )
+                    elif not rex_detections.bbox:
+                        self.node.get_logger().info(
+                            'Rex-Omniでも物体を検出しませんでした。'
+                        )
+                    else:
+                        rex_names = [
+                            bbox.name for bbox in rex_detections.bbox
+                        ]
+                        self.node.get_logger().info(
+                            f'Rex-Omniが検出した物体: {rex_names}'
+                        )
+                        rex_index = self._select_target(rex_detections)
+                        if rex_index < 0:
+                            self.node.get_logger().warning(
+                                'Rex-Omniは物体を検出しましたが、'
+                                '把持可能な深度またはmaskを'
+                                '取得できませんでした。'
+                            )
 
-                rex_index = self._select_target(rex_detections)
                 if rex_index < 0:
-                    self.node.get_logger().warning(
-                        'Rex-Omniは物体を検出しましたが、'
-                        '把持可能な深度またはmaskを取得できませんでした。'
+                    # 最後に、首を正面に向けた YOLO を1度だけ試します。
+                    # これで駄目なら none を返します。
+                    forward = self._forward_yolo_retry()
+                    if forward is None:
+                        self.empty_detection_count = 0
+                        self.node.get_logger().info(
+                            '物体を検出できなかったため、none を返します。'
+                        )
+                        return 'none'
+                    detections, index = forward
+                    self.node.get_logger().info(
+                        '正面向きの検出結果を把持処理へ渡します。'
                     )
-                    return 'failed'
-
-                detections = rex_detections
-                index = rex_index
-                self.node.get_logger().info(
-                    'Rex-Omniの検出結果を把持処理へ渡します。'
-                )
+                else:
+                    detections = rex_detections
+                    index = rex_index
+                    self.node.get_logger().info(
+                        'Rex-Omniの検出結果を把持処理へ渡します。'
+                    )
             else:
                 return 'failed'
 
-        # 物体を検出できた場合、連続未検出回数をリセットします。
+        # 物体を検出できたので、未検出回数をリセットします。
+        # 回頭回数は部屋ごとに数えるのでここでは戻しません。戻すと、
+        # _restore_rotation() で 60 度に戻したところからさらに 60 度
+        # 回ってしまいます。1 つの部屋で回すのは 1 回だけです。
         self.empty_detection_count = 0
+        self.forward_retry_done = False
         if index >= len(detections.segments):
             self.node.get_logger().error(
                 '検出物体に対応するマスクがありません。'
@@ -580,11 +1144,7 @@ class RecogState(State):
         stamped.header = detections.camera_info.header
         stamped.pose = grasp_response.grasp.pose
         try:
-            object_pose = self.tf_buffer.transform(
-                stamped,
-                'base_link',
-                timeout=Duration(seconds=2.0),
-            ).pose
+            object_pose = self._transform_pose(stamped, 'base_link')
         except TransformException as error:
             self.node.get_logger().error(
                 f'把持姿勢の TF 変換に失敗しました: {error}'
@@ -595,43 +1155,101 @@ class RecogState(State):
         height = grasp_response.grasp.size.z
         long_edge = grasp_response.grasp.size.x
         short_edge = grasp_response.grasp.size.y
+        box_yaw = tft.euler_from_quaternion([
+            object_pose.orientation.x,
+            object_pose.orientation.y,
+            object_pose.orientation.z,
+            object_pose.orientation.w,
+        ])[2]
         self.node.get_logger().info(
             '推定した物体寸法: '
             f'長辺={long_edge:.3f} m, 短辺={short_edge:.3f} m, '
-            f'高さ={height:.3f} m'
+            f'高さ={height:.3f} m / '
+            f'長辺方向(base_link)={math.degrees(box_yaw):.1f} deg / '
+            f'長短比={long_edge / short_edge if short_edge > 0.0 else float("inf"):.2f} / '
+            f'把持={"横" if height > TALL_THRESHOLD else "上"}'
         )
 
-        if height > TALL_THRESHOLD:
-            orientation, approach_axis = _box_aligned_grasp_orientation(
-                object_pose.orientation,
-                side_grasp=True,
-                object_xy=(object_pose.position.x, object_pose.position.y),
+        if object_pose.position.z < MIN_GRASP_HEIGHT:
+            self.node.get_logger().info(
+                f'把持位置が床に近すぎます '
+                f'(z={object_pose.position.z:.3f} m)。'
+                f'{MIN_GRASP_HEIGHT:.3f} m まで持ち上げます。'
             )
-            object_pose.position.x -= 0.1 * approach_axis[0]
-            object_pose.position.y -= 0.1 * approach_axis[1]
-            approach = 0.1
+            object_pose.position.z = MIN_GRASP_HEIGHT
+
+        if height > TALL_THRESHOLD:
+            orientation, approach_axis = _front_grasp_orientation(
+                (object_pose.position.x, object_pose.position.y),
+            )
+            # 手のひらを把持点の手前どれだけで止めるかは保ったまま、
+            # ロボットに近づきすぎない範囲でプリグラスプを下げます。
+            clearance = (
+                SIDE_GRASP_PREGRASP_DISTANCE - SIDE_GRASP_APPROACH_DISTANCE
+            )
+            object_distance = math.hypot(
+                object_pose.position.x,
+                object_pose.position.y,
+            )
+            standoff = min(
+                SIDE_GRASP_PREGRASP_DISTANCE,
+                max(0.0, object_distance - MIN_PREGRASP_RADIUS),
+            )
+            if standoff < SIDE_GRASP_PREGRASP_DISTANCE:
+                self.node.get_logger().warning(
+                    f'物体がロボットから {object_distance:.3f} m と近いため、'
+                    f'把持前姿勢を下げる量を '
+                    f'{SIDE_GRASP_PREGRASP_DISTANCE:.3f} m から '
+                    f'{standoff:.3f} m に減らします。'
+                )
+            object_pose.position.x -= standoff * approach_axis[0]
+            object_pose.position.y -= standoff * approach_axis[1]
+            approach = standoff - clearance
+            wrist_roll = None
             approach_yaw = math.atan2(approach_axis[1], approach_axis[0])
             self.node.get_logger().info(
-                '背が高い物体なので、短辺を挟む横把持にします。'
-                f'長辺方向からの接近角={math.degrees(approach_yaw):.1f} deg'
+                '背が高い物体なので、正面から手を伸ばす横把持にします。'
+                f'接近方向={math.degrees(approach_yaw):.1f} deg '
+                f'(ロボットから物体へ向かう向き)、'
+                f'把持点の {standoff * 100.0:.0f} cm 手前 '
+                f'(base_link から {object_distance - standoff:.2f} m) '
+                f'から {approach * 100.0:.0f} cm 伸ばして'
+                f'把持点の {clearance * 100.0:.0f} cm 手前で止めます。'
             )
         else:
-            orientation, _ = _box_aligned_grasp_orientation(
-                object_pose.orientation,
-                side_grasp=False,
-                object_xy=(object_pose.position.x, object_pose.position.y),
-            )
+            long_axis = _horizontal_long_axis(object_pose.orientation)
             object_pose.position.z += 0.1
             approach = 0.05
+
+            # 手のひらを真下に向ける姿勢だけを IK に渡します。
+            # yaw を姿勢に含めると arm_roll など別の関節へ逃げることがあるので、
+            # 短辺に合わせる回転は wrist_roll_joint へ明示的に指令します。
+            # hand_palm_link は wrist_roll_link に rpy(pi,0,0) で付いているため、
+            # 手のひらが真下のとき wrist_roll の回転軸は base_link の +Z と一致し、
+            # wrist_roll を +d 回すとハンドが鉛直まわりに +d 回ります。
+            qx, qy, qz, qw = tft.quaternion_from_euler(math.pi, 0.0, 0.0)
+            orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
+            wrist_roll = math.atan2(long_axis[1], long_axis[0])
             self.node.get_logger().info(
                 '平たい物体なので、短辺を挟む上把持にします。'
+                f'wrist_roll_joint を {math.degrees(wrist_roll):.1f} deg '
+                '回して短辺に合わせます。'
             )
 
         object_pose.orientation = orientation
 
         blackboard.grasp_pose = object_pose
         blackboard.grasp_approach = approach
+        # 上把持のときだけ、base_link 基準での目標ハンド yaw [rad]。
+        # 横把持では姿勢そのものに向きが入っているので None です。
+        blackboard.grasp_wrist_roll = wrist_roll
         blackboard.target_name = detections.bbox[index].name
+        # 把持の成否によらず、この部屋ではもうこの物体を狙いません。
+        # Grasp が失敗して Recog へ戻っても、次は別の物体を選びます。
+        self.attempted_names.add(blackboard.target_name.lower())
+        # このあと Move2GraspPoint が台車の向きを戻すので、次に来たときは
+        # 覚えている角度まで回し直します。
+        self.returned_after_grasp = True
         self.node.get_logger().info(
             f'{blackboard.target_name} の把持姿勢を Blackboard に保存しました。'
         )

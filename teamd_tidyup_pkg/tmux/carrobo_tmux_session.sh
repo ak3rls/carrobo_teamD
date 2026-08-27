@@ -140,7 +140,7 @@ tmux send-keys -t "$bringup_pane" \
 
 queue_ros_environment "$navigation_pane"
 tmux send-keys -t "$navigation_pane" \
-  'ros2 launch carrobo_slam navigation.launch.py map_name:=carrobo' C-m
+  'ros2 launch carrobo_slam navigation.launch.py map_name:=carrobo'
 
 queue_ros_environment "$tidyup_pane"
 # Prepare the command but leave it unexecuted for the operator.
