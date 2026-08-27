@@ -3,7 +3,9 @@
 from rclpy.node import Node
 from yasmin import Blackboard
 from yasmin import State
-from teamd_janken_interfaces.srv import hand_recog
+import random
+from teamd_janken_pkg.nodes.client_node import JankenClient
+
 
 
 class JankenState(State):
@@ -19,56 +21,42 @@ class JankenState(State):
     }
 
     def __init__(self, node: Node):
-        super().__init__(outcomes=['win', 'lose', 'failed'])
+        super().__init__(outcomes=['win', 'lose', 'draw'])
         self.node = node
+        self.client = JankenClient()
 
-        self.cli = self.create_client(hand_recog, "hand_recog_jg")
-        while not self.cli.wait_for_service(timeout_sec = 1.0):
-            self.get_logger().info("サーバーがひらくのを待ってます")
-        self.req = hand_recog.Request()
-
-    def send_request_hand(self, kara: int):
-        self.req. = int(kara)
-        future = self.cli.call_async(self.req)
-        rclpy.spin_until_future_complete(self, future)
-        return future.result()
 
     def execute(self, blackboard: Blackboard) -> str:
         """ロボット視点の勝敗を返す."""
         self.node.get_logger().info('Executing state JankenState')
+
+        robot_hand_rundom = random.choice(['rock','scissors','paper'])
         
         
-        robot_hand = getattr(blackboard, 'robot_hand', None)
-        human_hand = getattr(blackboard, 'human_hand', None)
+        robot_hand = self.client.send_robot_request(robot_hand_rundom)
+        human_hand = self.client.send_hand_request(1)
 
 
 
-        if robot_hand not in self.VALID_HANDS:
-            self.node.get_logger().error(
-                f'ロボットの手が不正です: {robot_hand}'
-            )
-            return 'failed'
+        # if robot_hand not in self.VALID_HANDS:
+        #     self.node.get_logger().error(
+        #         f'ロボットの手が不正です: {robot_hand}'
+        #     )
+        #     return 'failed'
 
-        if human_hand not in self.VALID_HANDS:
-            self.node.get_logger().error(
-                f'人間の手が不正です: {human_hand}'
-            )
-            return 'failed'
+        # if human_hand not in self.VALID_HANDS:
+        #     self.node.get_logger().error(
+        #         f'人間の手が不正です: {human_hand}'
+        #     )
+        #     return 'failed'
 
 
 
-        if robot_hand == human_hand:
+        if robot_hand_rundom == human_hand:
             result = 'draw'
-        elif (robot_hand, human_hand,) in self.ROBOT_WIN_PAIRS:
+        elif (robot_hand_rundom, human_hand,) in self.ROBOT_WIN_PAIRS:
             result = 'win'
         else:
             result = 'lose'
-
-        blackboard.janken_result = result
-
-        # self.node.get_logger().info(
-        #     f'勝敗判定: robot={robot_hand}, '
-        #     f'human={human_hand}, result={result}'
-        # )
 
         return result

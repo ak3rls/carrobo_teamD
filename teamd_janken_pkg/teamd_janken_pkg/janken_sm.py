@@ -12,7 +12,7 @@ from yasmin_viewer import YasminViewerPub
 from .states.continue_game import ContinueState
 from .states.human_hand import RecognizeHumanHandState
 from .states.janken import JankenState
-from .states.listener import WhisperState
+from .states.listener import Whisper_State
 from .states.move_backward import (
     MovebackwardState as MoveBackwardState,
 )
@@ -34,33 +34,14 @@ class JankenStateMachineNode(Node):
         self.blackboard.janken_result = None
 
         self.state_machine = StateMachine(
-            outcomes=['SUCCEEDED', 'FAILED']
+            outcomes=["EXIT"]
         )
 
         self.state_machine.add_state(
-            name='Whisper',
-            state=WhisperState(self),
+            name='Listener',
+            state=Whisper_State(self),
             transitions={
-                'success': 'RecognizeHumanHand', # 'succeeded'? 'success'?
-                'failed': 'FAILED',
-            },
-        )
-
-        self.state_machine.add_state(
-            name='RecognizeHumanHand',
-            state=RecognizeHumanHandState(self, self.hand_recognizer),
-            transitions={
-                'succeeded': 'ShowRobotHand',
-                'failed': 'RecognizeHumanHand',
-            },
-        )
-
-        self.state_machine.add_state(
-            name='ShowRobotHand',
-            state=ShowRobotHandState(self),
-            transitions={
-                'succeeded': 'Janken',
-                'failed': 'ShowRobotHand',
+                'success': 'Janken', 
             },
         )
 
@@ -70,8 +51,7 @@ class JankenStateMachineNode(Node):
             transitions={
                 'win': 'MoveForward',
                 'lose': 'MoveBackward',
-                'draw': 'RecognizeHumanHand',###
-                'failed': 'RecognizeHumanHand',
+                'draw': 'Listener',
             },
         )
 
@@ -97,9 +77,8 @@ class JankenStateMachineNode(Node):
             name='Continue',
             state=ContinueState(self),
             transitions={
-                'yes': 'Whisper',
-                'no': 'SUCCEEDED',
-                'failed': 'FAILED',
+                'yes': 'Listener',
+                'no': 'EXIT',
             },
         )
 

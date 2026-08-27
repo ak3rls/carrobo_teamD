@@ -35,7 +35,7 @@ class ContinueState(State):
     }
 
     def __init__(self, node: Node, max_attempts: int = 3): # max_attemps 試行回数
-        super().__init__(outcomes=['yes', 'no', 'failed'])
+        super().__init__(outcomes=['yes', 'no'])
         self.node = node
         self.max_attempts = max_attempts
 
@@ -70,7 +70,7 @@ class ContinueState(State):
             except (EOFError, KeyboardInterrupt):
                 print()
                 self.node.get_logger().warning('ターミナル入力が中断されました。')
-                return 'failed'
+                return
 
             normalized_answer = self._normalize_text(answer_text)
 
